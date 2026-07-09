@@ -1,20 +1,30 @@
 import type { ModelApiType, SettingsResult } from './types'
 
-const SETTINGS_STORAGE_KEY = 'brosdk-assistant-settings'
-
 export const DEFAULT_SETTINGS: SettingsResult = {
   configured: false,
   workspace_dir: '.',
+  default_workspace_dir: undefined,
   mcp_url: 'http://127.0.0.1:3000/mcp',
   model_base_url: '',
   model_name: '',
   model_api_type: 'openai',
   api_key: '',
   temperature: 0,
+  open_side_panel_on_action_click: true,
+  side_panel_per_window: false,
 }
 
 export function isSettingsConfigured(settings: SettingsResult) {
-  return Boolean(settings.configured)
+  return hasRequiredSettings(settings)
+}
+
+function hasRequiredSettings(settings: Partial<SettingsResult>) {
+  return Boolean(
+    settings.mcp_url?.trim() &&
+      settings.model_base_url?.trim() &&
+      settings.model_name?.trim() &&
+      settings.api_key?.trim(),
+  )
 }
 
 export function normalizeModelApiType(value: string): ModelApiType {
@@ -22,31 +32,24 @@ export function normalizeModelApiType(value: string): ModelApiType {
 }
 
 export function normalizeSettings(settings?: Partial<SettingsResult> | null): SettingsResult {
-  return {
+  const workspaceDir = settings?.workspace_dir ?? DEFAULT_SETTINGS.workspace_dir
+  const merged = {
     ...DEFAULT_SETTINGS,
     ...settings,
-    configured: Boolean(settings?.configured),
+    workspace_dir: typeof workspaceDir === 'string' ? workspaceDir : DEFAULT_SETTINGS.workspace_dir,
     model_api_type: normalizeModelApiType(settings?.model_api_type ?? DEFAULT_SETTINGS.model_api_type),
     temperature: Number(settings?.temperature ?? DEFAULT_SETTINGS.temperature) || 0,
+    open_side_panel_on_action_click:
+      settings?.open_side_panel_on_action_click ?? DEFAULT_SETTINGS.open_side_panel_on_action_click,
+    side_panel_per_window: settings?.side_panel_per_window ?? DEFAULT_SETTINGS.side_panel_per_window,
+  }
+
+  return {
+    ...merged,
+    configured: hasRequiredSettings(merged),
   }
 }
 
 export function formatModelApiType(value: ModelApiType) {
   return value === 'anthropic' ? 'Anthropic API' : 'OpenAI API'
-}
-
-export async function loadStoredSettings(): Promise<SettingsResult> {
-  const result = await chrome.storage.local.get(SETTINGS_STORAGE_KEY)
-  return normalizeSettings(result[SETTINGS_STORAGE_KEY] as Partial<SettingsResult> | undefined)
-}
-
-export async function saveStoredSettings(settings: SettingsResult): Promise<SettingsResult> {
-  const nextSettings = normalizeSettings({
-    ...settings,
-    configured: true,
-  })
-  await chrome.storage.local.set({
-    [SETTINGS_STORAGE_KEY]: nextSettings,
-  })
-  return nextSettings
 }

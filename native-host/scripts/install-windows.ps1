@@ -2,7 +2,10 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$ExtensionId,
 
-  [string]$Configuration = "release"
+  [string]$Configuration = "release",
+
+  [ValidateSet("Chrome", "Edge", "Chromium")]
+  [string[]]$Browsers = @("Chrome", "Edge", "Chromium")
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,11 +29,20 @@ $Manifest = [ordered]@{
 
 $Manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
 
-$RegistryPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\com.browsersdk.assistant"
-New-Item -Path $RegistryPath -Force | Out-Null
-Set-Item -Path $RegistryPath -Value (Resolve-Path -LiteralPath $ManifestPath).Path
+$BrowserRegistryRoots = @{
+  Chrome = "HKCU:\Software\Google\Chrome\NativeMessagingHosts"
+  Edge = "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts"
+  Chromium = "HKCU:\Software\Chromium\NativeMessagingHosts"
+}
+
+$RegisteredPaths = foreach ($Browser in $Browsers) {
+  $RegistryPath = Join-Path $BrowserRegistryRoots[$Browser] "com.browsersdk.assistant"
+  New-Item -Path $RegistryPath -Force | Out-Null
+  Set-Item -Path $RegistryPath -Value (Resolve-Path -LiteralPath $ManifestPath).Path
+  $RegistryPath
+}
 
 Write-Host "Installed native host manifest:"
 Write-Host "  $ManifestPath"
-Write-Host "Registered Chrome native host:"
-Write-Host "  $RegistryPath"
+Write-Host "Registered native host:"
+$RegisteredPaths | ForEach-Object { Write-Host "  $_" }

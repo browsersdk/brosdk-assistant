@@ -1,4 +1,5 @@
 import { defineBackground } from 'wxt/utils/define-background'
+import { DEFAULT_SETTINGS, normalizeSettings } from '../src/settings'
 import type {
   BackgroundRequest,
   BackgroundResponse,
@@ -6,14 +7,18 @@ import type {
   NativeRequest,
   NativeResponse,
   NativeStatus,
+  SettingsResult,
 } from '../src/types'
 
 const HOST_NAME = 'com.browsersdk.assistant'
+const SIDEPANEL_PATH = 'sidepanel.html'
+const LEGACY_SETTINGS_STORAGE_KEY = 'brosdk-assistant-settings'
 
 export default defineBackground(() => {
   let nativePort: chrome.runtime.Port | null = null
   let connected = false
   let lastError: string | undefined
+  let cachedSettings: SettingsResult = DEFAULT_SETTINGS
   const pending = new Map<
     string,
     {
@@ -22,13 +27,45 @@ export default defineBackground(() => {
     }
   >()
 
-  async function configureSidePanel() {
+  async function configureSidePanel(nextSettings?: SettingsResult) {
+    let settings = nextSettings ? normalizeSettings(nextSettings) : DEFAULT_SETTINGS
+    if (!nextSettings) {
+      try {
+        settings = normalizeSettings(
+          (await requestNative(createNativeRequest('settings.get'))) as Partial<SettingsResult>,
+        )
+      } catch (error) {
+        console.warn('[brosdk-assistant] failed to load native settings, using defaults', error)
+      }
+    }
+
     try {
-      await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true })
-      await chrome.sidePanel.setOptions({ path: 'sidepanel.html' })
+      cachedSettings = settings
+      await chrome.sidePanel.setPanelBehavior({
+        openPanelOnActionClick: false,
+      })
+      await chrome.sidePanel.setOptions({ path: SIDEPANEL_PATH, enabled: true })
     } catch (error) {
       console.warn('[brosdk-assistant] failed to configure side panel', error)
     }
+  }
+
+  function openConfiguredSidePanel(tab: chrome.tabs.Tab) {
+    const settings = cachedSettings
+    if (!settings.open_side_panel_on_action_click) return
+
+    if (settings.side_panel_per_window) {
+      if (typeof tab.windowId !== 'number') return
+      void chrome.sidePanel.open({ windowId: tab.windowId }).catch((error) => {
+        console.warn('[brosdk-assistant] failed to open side panel', error)
+      })
+      return
+    }
+
+    if (typeof tab.id !== 'number') return
+    void chrome.sidePanel.open({ tabId: tab.id }).catch((error) => {
+      console.warn('[brosdk-assistant] failed to open side panel', error)
+    })
   }
 
   function connectNative() {
@@ -58,6 +95,7 @@ export default defineBackground(() => {
         return
       }
 
+      void syncSettingsFromNative()
       void chrome.runtime.sendMessage({ type: 'native.event', event: message }).catch(() => undefined)
     })
 
@@ -85,16 +123,42 @@ export default defineBackground(() => {
     })
   }
 
+  function createNativeRequest(method: string, params?: unknown): NativeRequest {
+    return {
+      id: `bg-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      method,
+      params,
+    }
+  }
+
+  async function syncSettingsFromNative() {
+    try {
+      const settings = normalizeSettings(
+        (await requestNative(createNativeRequest('settings.get'))) as Partial<SettingsResult>,
+      )
+      await configureSidePanel(settings)
+      void chrome.runtime.sendMessage({ type: 'settings.changed', settings }).catch(() => undefined)
+    } catch (error) {
+      console.warn('[brosdk-assistant] failed to sync native settings', error)
+    }
+  }
+
   function status(): NativeStatus {
     return { connected, lastError }
   }
 
   chrome.runtime.onInstalled.addListener(() => {
+    void chrome.storage.local.remove(LEGACY_SETTINGS_STORAGE_KEY)
     void configureSidePanel()
   })
 
   chrome.runtime.onStartup.addListener(() => {
+    void chrome.storage.local.remove(LEGACY_SETTINGS_STORAGE_KEY)
     void configureSidePanel()
+  })
+
+  chrome.action.onClicked.addListener((tab) => {
+    openConfiguredSidePanel(tab)
   })
 
   chrome.runtime.onMessage.addListener((message: BackgroundRequest, _sender, sendResponse) => {
@@ -114,9 +178,15 @@ export default defineBackground(() => {
       return true
     }
 
+    if (message?.type === 'settings.changed') {
+      void configureSidePanel(message.settings)
+      sendResponse({ ok: true } satisfies BackgroundResponse)
+      return false
+    }
+
     return false
   })
 
+  void chrome.storage.local.remove(LEGACY_SETTINGS_STORAGE_KEY)
   void configureSidePanel()
 })
-

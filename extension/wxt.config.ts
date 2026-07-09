@@ -11,10 +11,7 @@ export default defineConfig({
     side_panel: {
       default_path: 'sidepanel.html',
     },
-    options_ui: {
-      page: 'options.html',
-      open_in_tab: true,
-    },
+    options_page: 'settings.html',
     action: {
       default_title: 'Brosdk Assistant',
       default_icon: {

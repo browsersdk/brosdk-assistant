@@ -8,7 +8,7 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { callNative } from './nativeClient'
-import { DEFAULT_SETTINGS, loadStoredSettings, saveStoredSettings } from './settings'
+import { DEFAULT_SETTINGS, normalizeSettings } from './settings'
 import type { HealthResult, ModelApiType, SettingsResult } from './types'
 
 type SaveState =
@@ -38,27 +38,18 @@ export function OptionsApp() {
   async function loadSettings() {
     setStatus({ kind: 'checking', text: 'Loading configuration...' })
     try {
-      const nextSettings = await loadStoredSettings()
-      setSettings(nextSettings)
-      setDraftSettings(nextSettings)
-    } catch (error) {
-      setStatus({
-        kind: 'error',
-        text: `Failed to load configuration: ${error instanceof Error ? error.message : String(error)}`,
-      })
-      return
-    }
-
-    try {
       const health = await callNative<HealthResult>('agent.health')
+      const syncedSettings = normalizeSettings(await callNative<SettingsResult>('settings.get'))
+      setSettings(syncedSettings)
+      setDraftSettings(syncedSettings)
       setStatus({
         kind: 'success',
         text: `Configuration loaded. Native host ready: ${health.service} ${health.version}`,
       })
     } catch (error) {
       setStatus({
-        kind: 'idle',
-        text: `Configuration loaded. Native host not connected: ${
+        kind: 'error',
+        text: `Native host not connected. Configuration is stored in native host only: ${
           error instanceof Error ? error.message : String(error)
         }`,
       })
@@ -67,29 +58,21 @@ export function OptionsApp() {
 
   async function saveSettings() {
     setStatus({ kind: 'checking', text: 'Saving configuration...' })
-    let nextSettings: SettingsResult
     try {
-      nextSettings = await saveStoredSettings(draftSettings)
+      const nextSettings = normalizeSettings(await callNative<SettingsResult>('settings.set', draftSettings))
       setSettings(nextSettings)
       setDraftSettings(nextSettings)
-    } catch (error) {
-      setStatus({
-        kind: 'error',
-        text: `Save failed: ${error instanceof Error ? error.message : String(error)}`,
-      })
-      return
-    }
-
-    try {
-      await callNative<SettingsResult>('settings.set', nextSettings)
+      await chrome.runtime
+        .sendMessage({ type: 'settings.changed', settings: nextSettings })
+        .catch(() => undefined)
       setStatus({
         kind: 'success',
         text: `Configuration saved. Native host synced for ${nextSettings.model_name}`,
       })
     } catch (error) {
       setStatus({
-        kind: 'success',
-        text: `Configuration saved. Native host not connected: ${
+        kind: 'error',
+        text: `Save failed. Native host is required: ${
           error instanceof Error ? error.message : String(error)
         }`,
       })
@@ -196,8 +179,9 @@ export function OptionsApp() {
             id="api-key"
             value={draftSettings.api_key}
             onChange={(event) => updateDraft('api_key', event.target.value)}
-            placeholder="optional"
+            placeholder="sk-..."
             type="password"
+            required
           />
 
           <label htmlFor="temperature">Temperature</label>
@@ -216,8 +200,37 @@ export function OptionsApp() {
             id="workspace-dir"
             value={draftSettings.workspace_dir}
             onChange={(event) => updateDraft('workspace_dir', event.target.value)}
-            placeholder="."
+            placeholder={draftSettings.default_workspace_dir || 'Native default workspace'}
           />
+
+          <div className="settings-section-title">Side Panel</div>
+          <div className="settings-toggle-row">
+            <div>
+              <label htmlFor="open-side-panel-on-action">Open on Extension Click</label>
+              <p>Open the assistant side panel when the toolbar icon is clicked.</p>
+            </div>
+            <input
+              id="open-side-panel-on-action"
+              checked={draftSettings.open_side_panel_on_action_click}
+              onChange={(event) =>
+                updateDraft('open_side_panel_on_action_click', event.target.checked)
+              }
+              type="checkbox"
+            />
+          </div>
+
+          <div className="settings-toggle-row">
+            <div>
+              <label htmlFor="side-panel-per-window">Share Side Panel Across Tabs</label>
+              <p>Use one side panel for the whole window instead of treating tabs separately.</p>
+            </div>
+            <input
+              id="side-panel-per-window"
+              checked={draftSettings.side_panel_per_window}
+              onChange={(event) => updateDraft('side_panel_per_window', event.target.checked)}
+              type="checkbox"
+            />
+          </div>
 
           <div className="settings-actions">
             <button className="configure-button" type="submit" disabled={saving}>
