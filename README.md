@@ -26,6 +26,24 @@ npm run typecheck
 npm run build
 ```
 
+## Package Windows Release
+
+Use the release packager from the repository root:
+
+```powershell
+python scripts\package_release.py --version 0.1.0
+```
+
+The script runs extension typecheck/build/zip, runs native-host tests, builds
+the release native host, and writes release assets to `.output/release/`:
+
+- `brosdk-assistant-v0.1.0-windows.zip` - Windows install package.
+- `brosdk-assistant-extension-v0.1.0-chrome.zip` - standalone extension zip.
+
+The Windows install package contains only `extension/chrome-mv3` for unpacked
+extension loading. The standalone extension zip is kept as a separate asset to
+avoid duplicate extension payloads inside the package.
+
 ## Native Host Install On Windows
 
 1. Build the native host:
