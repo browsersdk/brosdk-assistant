@@ -54,6 +54,24 @@ HKCU\Software\Google\Chrome\NativeMessagingHosts\com.browsersdk.assistant
 
 Reload the extension after registration.
 
+## Current Settings
+
+The side panel Settings panel stores these values through the Rust native host:
+
+- MCP URL
+- model API type
+- model base URL
+- model name
+- model API key
+- temperature
+- workspace folder
+
+On Windows, native-host settings are saved under:
+
+```text
+%APPDATA%\BrosdkAssistant\settings.json
+```
+
 ## Native Messaging Smoke Test
 
 The Rust host can be tested without Chrome by sending length-prefixed JSON to

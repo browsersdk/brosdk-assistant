@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process;
 
 const SERVICE_NAME: &str = "brosdk-assistant-native";
@@ -31,10 +33,15 @@ struct ErrorBody {
     message: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
     workspace_dir: String,
-    model: String,
+    mcp_url: String,
+    model_base_url: String,
+    model_name: String,
+    model_api_type: String,
+    api_key: String,
+    temperature: f64,
 }
 
 impl Default for Settings {
@@ -44,13 +51,18 @@ impl Default for Settings {
                 .ok()
                 .map(|path| path.display().to_string())
                 .unwrap_or_default(),
-            model: "not-configured".to_string(),
+            mcp_url: "http://127.0.0.1:3000/mcp".to_string(),
+            model_base_url: "https://api.deepseek.com".to_string(),
+            model_name: "deepseek-v4-flash".to_string(),
+            model_api_type: "openai-compatible".to_string(),
+            api_key: String::new(),
+            temperature: 0.0,
         }
     }
 }
 
 fn main() {
-    let mut settings = Settings::default();
+    let mut settings = load_settings();
     let ready = json!({
         "event": "native.ready",
         "payload": {
@@ -108,8 +120,30 @@ fn handle_request(request: Request, settings: &mut Settings) -> Response {
             {
                 settings.workspace_dir = workspace_dir.to_string();
             }
-            if let Some(model) = request.params.get("model").and_then(Value::as_str) {
-                settings.model = model.to_string();
+            if let Some(mcp_url) = request.params.get("mcp_url").and_then(Value::as_str) {
+                settings.mcp_url = mcp_url.to_string();
+            }
+            if let Some(model_base_url) =
+                request.params.get("model_base_url").and_then(Value::as_str)
+            {
+                settings.model_base_url = model_base_url.to_string();
+            }
+            if let Some(model_name) = request.params.get("model_name").and_then(Value::as_str) {
+                settings.model_name = model_name.to_string();
+            }
+            if let Some(model_api_type) =
+                request.params.get("model_api_type").and_then(Value::as_str)
+            {
+                settings.model_api_type = model_api_type.to_string();
+            }
+            if let Some(api_key) = request.params.get("api_key").and_then(Value::as_str) {
+                settings.api_key = api_key.to_string();
+            }
+            if let Some(temperature) = request.params.get("temperature").and_then(Value::as_f64) {
+                settings.temperature = temperature;
+            }
+            if let Err(error) = save_settings(settings) {
+                eprintln!("[native] failed to save settings: {error}");
             }
             ok(request.id, settings_json(settings))
         }
@@ -117,6 +151,9 @@ fn handle_request(request: Request, settings: &mut Settings) -> Response {
             if let Some(workspace_dir) = request.params.get("workspace_dir").and_then(Value::as_str)
             {
                 settings.workspace_dir = workspace_dir.to_string();
+                if let Err(error) = save_settings(settings) {
+                    eprintln!("[native] failed to save settings: {error}");
+                }
                 ok(request.id, settings_json(settings))
             } else {
                 err(request.id, "invalid_params", "workspace_dir is required")
@@ -139,8 +176,49 @@ fn handle_request(request: Request, settings: &mut Settings) -> Response {
 fn settings_json(settings: &Settings) -> Value {
     json!({
         "workspace_dir": settings.workspace_dir,
-        "model": settings.model
+        "mcp_url": settings.mcp_url,
+        "model_base_url": settings.model_base_url,
+        "model_name": settings.model_name,
+        "model_api_type": settings.model_api_type,
+        "api_key": settings.api_key,
+        "temperature": settings.temperature
     })
+}
+
+fn load_settings() -> Settings {
+    let Some(path) = settings_path() else {
+        return Settings::default();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Settings::default();
+    };
+    serde_json::from_str(&text).unwrap_or_else(|error| {
+        eprintln!("[native] failed to parse settings, using defaults: {error}");
+        Settings::default()
+    })
+}
+
+fn save_settings(settings: &Settings) -> io::Result<()> {
+    let Some(path) = settings_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let text = serde_json::to_string_pretty(settings).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to encode settings: {error}"),
+        )
+    })?;
+    fs::write(path, text)
+}
+
+fn settings_path() -> Option<PathBuf> {
+    let base = env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(PathBuf::from))?;
+    Some(base.join("BrosdkAssistant").join("settings.json"))
 }
 
 fn ok(id: String, result: Value) -> Response {

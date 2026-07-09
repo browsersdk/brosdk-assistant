@@ -128,6 +128,21 @@ Initial methods:
 - `settings.get`
 - `settings.set`
 
+Initial persisted settings:
+
+- `mcp_url`
+- `model_base_url`
+- `model_name`
+- `model_api_type`
+- `api_key`
+- `temperature`
+- `workspace_dir`
+
+The first Rust implementation stores settings in the user profile:
+
+- Windows: `%APPDATA%\BrosdkAssistant\settings.json`
+- Other platforms: `$HOME/BrosdkAssistant/settings.json`
+
 Initial events:
 
 - `native.ready`
@@ -167,4 +182,3 @@ Milestone 1 should provide a complete local communication loop:
 - Long model output must stream as small `agent.delta` events.
 - If multiple side-panel views open, the background script should multiplex them
   over one native port.
-

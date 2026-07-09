@@ -51,12 +51,19 @@ export type EchoResult = {
 
 export type SettingsResult = {
   workspace_dir: string
-  model: string
+  mcp_url: string
+  model_base_url: string
+  model_name: string
+  model_api_type: ModelApiType
+  api_key: string
+  temperature: number
 }
+
+export type ModelApiType = 'openai-compatible' | 'deepseek' | 'openai' | 'custom'
 
 export type ChatMessage = {
   id: string
   role: 'user' | 'assistant' | 'error'
   content: string
+  time: string
 }
-
