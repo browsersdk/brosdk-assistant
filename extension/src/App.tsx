@@ -332,7 +332,7 @@ export function App() {
           ...settings,
           workspace_dir: '',
         })
-        setHealth({ kind: 'idle', text: 'No workspace selected' })
+        setHealth({ kind: 'idle', text: 'Local file tools off' })
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error)
         setHealth({ kind: 'error', text: `Failed to clear workspace: ${text}` })
@@ -502,11 +502,11 @@ export function App() {
           <button
             className={`mode-toggle ${mode}`}
             type="button"
-            title={mode === 'agent' ? 'AI can browse and use tools' : 'AI can only chat'}
+            title={mode === 'agent' ? 'Allow tool use and task actions' : 'Read-only conversation'}
             onClick={() => setMode((current) => (current === 'agent' ? 'chat' : 'agent'))}
           >
             {mode === 'agent' ? <MousePointer2 size={13} /> : <MessageSquare size={13} />}
-            <span>{mode === 'agent' ? 'Agent Mode ON' : 'Chat Mode ON'}</span>
+            <span>{mode === 'agent' ? 'Agent Mode' : 'Chat Mode'}</span>
           </button>
           <span className="toolbar-divider" />
           <button
@@ -939,7 +939,7 @@ function EmptyState({
     mode === 'agent'
       ? [
           'Summarize this page and find next actions',
-          'Use available MCP tools to inspect my workspace',
+          'Inspect local files with available tools',
           'Help me complete this browser task',
         ]
       : ['Summarize this page', 'What is important here?', 'Draft a reply based on this page']

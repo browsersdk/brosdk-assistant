@@ -11,7 +11,7 @@ This is the implementation plan for the new `brosdk-assistant` project.
 - Keep the extension UI responsive and event-driven.
 - Use an original `message-bot` style icon inspired by common message and bot
   icon patterns, without copying Font Awesome assets.
-- Keep BrowserOS as a reference only. This project remains independent.
+- Keep product identity, source code, and UI implementation independent.
 
 ## Architecture
 
@@ -226,7 +226,7 @@ The native host should remain MCP-server agnostic:
 
 - It discovers tools with `tools/list`.
 - It forwards tool calls through `tools/call`.
-- It does not require BrowserOS-specific APIs.
+- It does not require vendor-specific browser APIs.
 - It keeps a `tool_name_map` to map OpenAI-safe function names back to original
   MCP tool names.
 
@@ -302,11 +302,11 @@ The default workspace is created by the native host when needed. Selecting
 
 The side panel has two user-facing modes:
 
-- `Agent Mode ON`
+- `Agent Mode`
   - full browser MCP tools.
   - full workspace tools when a workspace exists.
   - can act, navigate, write files, and edit files when requested.
-- `Chat Mode ON`
+- `Chat Mode`
   - read-only browser and workspace behavior.
   - can inspect current/attached pages.
   - can read/search workspace files.
@@ -320,8 +320,8 @@ The mode is passed from the side panel to `agent.run` as `mode: "chat" |
 - workspace tool gating.
 - system prompt mode guidance.
 
-This follows the BrowserOS pattern: the UI controls mode, but enforcement is in
-the agent/server layer, not only in the UI.
+The UI controls mode selection, while the native host enforces tool filtering
+and action limits.
 
 ## Response Debug Details
 
