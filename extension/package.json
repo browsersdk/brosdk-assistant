@@ -1,0 +1,26 @@
+{
+  "name": "brosdk-assistant-extension",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "generate:icons": "node scripts/generate-icons.mjs",
+    "zip": "wxt zip",
+    "prepare": "wxt prepare",
+    "typecheck": "wxt prepare && tsc --noEmit"
+  },
+  "dependencies": {
+    "@wxt-dev/module-react": "^1.1.5",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "wxt": "^0.20.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.289",
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.3",
+    "typescript": "^5.7.3"
+  }
+}

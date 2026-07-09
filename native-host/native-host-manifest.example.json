@@ -1,0 +1,10 @@
+{
+  "name": "com.browsersdk.assistant",
+  "description": "Brosdk Assistant Native Host",
+  "path": "D:\\go\\src\\browsersdk\\github\\brosdk-assistant\\native-host\\target\\release\\brosdk-assistant-native.exe",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://REPLACE_WITH_EXTENSION_ID/"
+  ]
+}
+
