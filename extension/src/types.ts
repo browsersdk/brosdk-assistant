@@ -49,7 +49,17 @@ export type EchoResult = {
   echo: unknown
 }
 
+export type AgentRunResult = {
+  accepted: boolean
+  message: string
+  llm_tool_count: number
+  mcp_tool_count: number
+  tools?: unknown[]
+  tool_name_map?: Record<string, string>
+}
+
 export type SettingsResult = {
+  configured: boolean
   workspace_dir: string
   mcp_url: string
   model_base_url: string
@@ -59,7 +69,7 @@ export type SettingsResult = {
   temperature: number
 }
 
-export type ModelApiType = 'openai-compatible' | 'deepseek' | 'openai' | 'custom'
+export type ModelApiType = 'openai' | 'anthropic'
 
 export type ChatMessage = {
   id: string

@@ -50,7 +50,7 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-rows: auto auto auto auto 1fr auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
   gap: 10px;
   height: 100%;
   min-width: 320px;
@@ -63,6 +63,11 @@ button {
 .status-strip,
 .settings-row,
 .config-context,
+.configure-notice,
+.configure-button,
+.options-header,
+.options-panel-header,
+.settings-actions,
 .message-meta,
 .composer {
   display: flex;
@@ -170,12 +175,59 @@ h1 {
   font-size: 13px;
 }
 
-.status-strip.online {
+.status-strip.online,
+.status-strip.success {
   color: var(--green);
 }
 
 .status-strip.error {
   color: var(--red);
+}
+
+.configure-notice {
+  justify-content: space-between;
+  gap: 12px;
+  border: 1px solid rgb(169 105 25 / 32%);
+  border-radius: 8px;
+  background: #fff8ec;
+  padding: 12px;
+  box-shadow: var(--shadow);
+}
+
+.configure-notice h2 {
+  margin-bottom: 4px;
+  font-size: 14px;
+}
+
+.configure-notice p {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.configure-button {
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  padding: 0 12px;
+  white-space: nowrap;
+  transition:
+    transform 120ms ease,
+    background 120ms ease;
+}
+
+.configure-button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  background: var(--accent-strong);
+}
+
+.configure-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .settings-panel {
@@ -330,3 +382,81 @@ textarea {
   transform: none;
 }
 
+.options-shell {
+  width: min(880px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 28px 0 48px;
+}
+
+.options-header {
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.options-brand .brand-mark {
+  width: 40px;
+  height: 40px;
+  flex-basis: 40px;
+}
+
+.options-brand h1 {
+  font-size: 20px;
+}
+
+.options-panel {
+  margin-top: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 92%);
+  box-shadow: var(--shadow);
+}
+
+.options-panel-header {
+  gap: 10px;
+  border-bottom: 1px solid var(--border);
+  padding: 18px 20px;
+}
+
+.options-panel-header h2 {
+  font-size: 16px;
+}
+
+.options-panel-header p {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.settings-form {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.32fr) minmax(0, 1fr);
+  gap: 14px 18px;
+  padding: 20px;
+}
+
+.settings-form label {
+  align-self: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.settings-actions {
+  grid-column: 2;
+  justify-content: flex-end;
+  padding-top: 4px;
+}
+
+@media (max-width: 640px) {
+  .options-shell {
+    width: min(100% - 24px, 880px);
+    padding-top: 18px;
+  }
+
+  .settings-form {
+    grid-template-columns: 1fr;
+  }
+
+  .settings-actions {
+    grid-column: 1;
+  }
+}

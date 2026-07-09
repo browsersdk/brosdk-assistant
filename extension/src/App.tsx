@@ -1,22 +1,26 @@
 import {
-  Bot,
   CircleAlert,
   CircleCheck,
   CircleDot,
   Eraser,
   RefreshCw,
-  Save,
   Send,
   Settings,
   Square,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { callNative, getNativeStatus } from './nativeClient'
+import {
+  DEFAULT_SETTINGS,
+  formatModelApiType,
+  isSettingsConfigured,
+  loadStoredSettings,
+  normalizeSettings,
+} from './settings'
 import type {
+  AgentRunResult,
   ChatMessage,
-  EchoResult,
   HealthResult,
-  ModelApiType,
   NativeStatus,
   SettingsResult,
 } from './types'
@@ -26,16 +30,6 @@ type HealthState =
   | { kind: 'online'; text: string }
   | { kind: 'error'; text: string }
   | { kind: 'idle'; text: string }
-
-const DEFAULT_SETTINGS: SettingsResult = {
-  workspace_dir: '',
-  mcp_url: 'http://127.0.0.1:3000/mcp',
-  model_base_url: 'https://api.deepseek.com',
-  model_name: 'deepseek-v4-flash',
-  model_api_type: 'openai-compatible',
-  api_key: '',
-  temperature: 0,
-}
 
 function createId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`
@@ -59,15 +53,14 @@ export function App() {
     text: 'Native host not checked',
   })
   const [settings, setSettings] = useState<SettingsResult>(DEFAULT_SETTINGS)
-  const [draftSettings, setDraftSettings] = useState<SettingsResult>(DEFAULT_SETTINGS)
-  const [settingsOpen, setSettingsOpen] = useState(false)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [prompt, setPrompt] = useState('')
   const [busy, setBusy] = useState(false)
   const messagesRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  const canSend = prompt.trim().length > 0 && !busy
+  const configured = isSettingsConfigured(settings)
+  const canSend = prompt.trim().length > 0 && !busy && configured
 
   const statusIcon = useMemo(() => {
     if (health.kind === 'online') return <CircleCheck size={16} />
@@ -87,14 +80,21 @@ export function App() {
   }, [messages])
 
   async function checkNative() {
+    setHealth({ kind: 'checking', text: 'Loading configuration...' })
+    try {
+      const nextSettings = await loadStoredSettings()
+      setSettings(normalizeSettings(nextSettings))
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      setHealth({ kind: 'error', text: `Failed to load configuration: ${text}` })
+      return
+    }
+
     setHealth({ kind: 'checking', text: 'Checking native host...' })
     try {
       const result = await callNative<HealthResult>('agent.health')
-      const nextSettings = await callNative<SettingsResult>('settings.get')
       const status = await getNativeStatus()
       setNativeStatus(status)
-      setSettings(nextSettings)
-      setDraftSettings(nextSettings)
       setHealth({
         kind: 'online',
         text: `${result.service} ${result.version} · pid ${result.pid}`,
@@ -103,24 +103,6 @@ export function App() {
       const text = error instanceof Error ? error.message : String(error)
       setNativeStatus({ connected: false, lastError: text })
       setHealth({ kind: 'error', text })
-    }
-  }
-
-  async function saveSettings() {
-    setHealth({ kind: 'checking', text: 'Saving settings...' })
-    try {
-      const nextSettings = await callNative<SettingsResult>('settings.set', draftSettings)
-      setSettings(nextSettings)
-      setDraftSettings(nextSettings)
-      setHealth({
-        kind: 'online',
-        text: `Settings saved · ${nextSettings.model_name}`,
-      })
-    } catch (error) {
-      setHealth({
-        kind: 'error',
-        text: error instanceof Error ? error.message : String(error),
-      })
     }
   }
 
@@ -150,7 +132,7 @@ export function App() {
     ])
 
     try {
-      const result = await callNative<EchoResult>('agent.echo', {
+      const result = await callNative<AgentRunResult>('agent.run', {
         message: raw,
         settings,
       })
@@ -159,7 +141,7 @@ export function App() {
         {
           id: createId(),
           role: 'assistant',
-          content: `Native host echo:\n${JSON.stringify(result.echo, null, 2)}`,
+          content: `${result.message}\n\nPrepared ${result.llm_tool_count} LLM tools from ${result.mcp_tool_count} MCP tools.`,
           time: nowLabel(),
         },
       ])
@@ -181,11 +163,8 @@ export function App() {
     }
   }
 
-  function updateDraft<K extends keyof SettingsResult>(key: K, value: SettingsResult[K]) {
-    setDraftSettings((current) => ({
-      ...current,
-      [key]: value,
-    }))
+  function openOptionsPage() {
+    void chrome.runtime.openOptionsPage()
   }
 
   return (
@@ -213,7 +192,7 @@ export function App() {
             className="icon-button"
             type="button"
             title="Settings"
-            onClick={() => setSettingsOpen((value) => !value)}
+            onClick={openOptionsPage}
           >
             <Settings size={16} />
           </button>
@@ -228,87 +207,22 @@ export function App() {
         <span>{health.text}</span>
       </section>
 
-      {settingsOpen && (
-        <section className="settings-panel">
-          <label htmlFor="mcp-url">MCP URL</label>
-          <input
-            id="mcp-url"
-            value={draftSettings.mcp_url}
-            onChange={(event) => updateDraft('mcp_url', event.target.value)}
-            placeholder={DEFAULT_SETTINGS.mcp_url}
-          />
-
-          <label htmlFor="model-api-type">Model API Type</label>
-          <select
-            id="model-api-type"
-            value={draftSettings.model_api_type}
-            onChange={(event) => updateDraft('model_api_type', event.target.value as ModelApiType)}
-          >
-            <option value="openai-compatible">OpenAI compatible</option>
-            <option value="deepseek">DeepSeek</option>
-            <option value="openai">OpenAI</option>
-            <option value="custom">Custom</option>
-          </select>
-
-          <label htmlFor="model-base-url">Model Base URL</label>
-          <input
-            id="model-base-url"
-            value={draftSettings.model_base_url}
-            onChange={(event) => updateDraft('model_base_url', event.target.value)}
-            placeholder={DEFAULT_SETTINGS.model_base_url}
-          />
-
-          <label htmlFor="model-name">Model Name</label>
-          <input
-            id="model-name"
-            value={draftSettings.model_name}
-            onChange={(event) => updateDraft('model_name', event.target.value)}
-            placeholder={DEFAULT_SETTINGS.model_name}
-          />
-
-          <label htmlFor="api-key">Model API Key</label>
-          <input
-            id="api-key"
-            value={draftSettings.api_key}
-            onChange={(event) => updateDraft('api_key', event.target.value)}
-            placeholder="optional"
-            type="password"
-          />
-
-          <label htmlFor="temperature">Temperature</label>
-          <input
-            id="temperature"
-            value={draftSettings.temperature}
-            onChange={(event) => updateDraft('temperature', Number(event.target.value) || 0)}
-            step="0.1"
-            type="number"
-          />
-
-          <label htmlFor="workspace-dir">Workspace Folder</label>
-          <div className="settings-row">
-            <input
-              id="workspace-dir"
-              value={draftSettings.workspace_dir}
-              onChange={(event) => updateDraft('workspace_dir', event.target.value)}
-              placeholder="D:\work\my-project"
-            />
-            <button className="icon-button primary" type="button" title="Save" onClick={saveSettings}>
-              <Save size={16} />
-            </button>
-          </div>
+      {configured ? (
+        <section className="config-context">
+          <span>MCP</span>
+          <strong title={settings.mcp_url}>{settings.mcp_url}</strong>
+          <span>Model</span>
+          <strong title={`${settings.model_base_url} · ${settings.model_name}`}>
+            {settings.model_name} · {formatModelApiType(settings.model_api_type)}
+          </strong>
+          <span>Workspace</span>
+          <strong title={settings.workspace_dir}>
+            {settings.workspace_dir ? shortPath(settings.workspace_dir) : 'No workspace'}
+          </strong>
         </section>
+      ) : (
+        <ConfigureNotice onConfigure={openOptionsPage} />
       )}
-
-      <section className="config-context">
-        <span>MCP</span>
-        <strong title={settings.mcp_url}>{settings.mcp_url}</strong>
-        <span>Model</span>
-        <strong title={`${settings.model_base_url} · ${settings.model_name}`}>
-          {settings.model_name} · {settings.model_api_type}
-        </strong>
-        <span>Workspace</span>
-        <strong title={settings.workspace_dir}>{settings.workspace_dir ? shortPath(settings.workspace_dir) : 'No workspace'}</strong>
-      </section>
 
       <div className="messages" ref={messagesRef}>
         {messages.length === 0 ? (
@@ -336,8 +250,8 @@ export function App() {
                 void submitPrompt()
               }
             }}
-            placeholder="What should I do?"
-            disabled={busy}
+            placeholder={configured ? 'What should I do?' : '请先前往配置'}
+            disabled={busy || !configured}
             rows={1}
           />
           <button className="send-button" type={busy ? 'button' : 'submit'} disabled={!canSend && !busy}>
@@ -346,6 +260,21 @@ export function App() {
         </form>
       </footer>
     </main>
+  )
+}
+
+function ConfigureNotice({ onConfigure }: { onConfigure: () => void }) {
+  return (
+    <section className="configure-notice">
+      <div>
+        <h2>请前往配置</h2>
+        <p>插件需要先配置 MCP、模型和工作目录后才能开始会话。</p>
+      </div>
+      <button className="configure-button" type="button" onClick={onConfigure}>
+        <Settings size={15} />
+        配置
+      </button>
+    </section>
   )
 }
 
@@ -369,4 +298,3 @@ function MessageBubble({ message }: { message: ChatMessage }) {
     </article>
   )
 }
-
