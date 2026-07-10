@@ -96,7 +96,8 @@ Browser tools source controls how the assistant reads or acts on browser pages:
 - `MCP Server` uses the configured MCP URL and is best when a CDP-backed MCP
   server is running.
 - `Chrome Extension` uses extension APIs and injected scripts, so it can read
-  page text, list tabs, extract links, navigate, click, and type without CDP.
+  page text, list tabs, snapshot actionable elements, extract links, navigate,
+  click, and type without CDP.
 - `Off` disables browser page tools while keeping model chat and workspace
   tools available.
 

@@ -220,6 +220,7 @@ Chrome Extension mode currently provides:
 - `browser_tabs`
 - `browser_active_tab`
 - `browser_read_page`
+- `browser_snapshot`
 - `browser_extract_links`
 - `browser_navigate`
 - `browser_click`
@@ -227,6 +228,10 @@ Chrome Extension mode currently provides:
 
 Chat Mode exposes only read-only extension browser tools. Agent Mode also
 exposes navigation, click, and type tools.
+
+`browser_snapshot` returns interactive elements with refs such as `e12`.
+`browser_click` and `browser_type` should prefer those refs over CSS selectors
+or text matching.
 
 Extension mode is intentionally a lighter fallback than CDP-backed MCP:
 
