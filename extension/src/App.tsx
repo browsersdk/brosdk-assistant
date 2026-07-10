@@ -1163,7 +1163,8 @@ function RunDetailsDialog({
           <div>
             <h2>Run details</h2>
             <p>
-              {debug.llm_tool_count} LLM tools · {debug.mcp_tool_count} MCP tools
+              {debug.llm_tool_count} LLM tools · {debug.mcp_tool_count} MCP tools ·{' '}
+              {debug.extension_tool_count ?? 0} extension tools
             </p>
           </div>
           <button className="icon-button" type="button" title="Close" onClick={onClose}>

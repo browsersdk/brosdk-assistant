@@ -76,7 +76,8 @@ Reload the extension after registration.
 
 The side panel Settings panel stores these values through the Rust native host:
 
-- MCP URL
+- browser tools source: MCP Server, Chrome Extension, or Off
+- MCP URL, required only when browser tools source is MCP Server
 - model API type
 - model base URL
 - model name
@@ -89,6 +90,15 @@ On Windows, native-host settings are saved under:
 ```text
 %APPDATA%\BrosdkAssistant\settings.json
 ```
+
+Browser tools source controls how the assistant reads or acts on browser pages:
+
+- `MCP Server` uses the configured MCP URL and is best when a CDP-backed MCP
+  server is running.
+- `Chrome Extension` uses extension APIs and injected scripts, so it can read
+  page text, list tabs, extract links, navigate, click, and type without CDP.
+- `Off` disables browser page tools while keeping model chat and workspace
+  tools available.
 
 ## Native Messaging Smoke Test
 

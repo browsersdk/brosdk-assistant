@@ -58,6 +58,7 @@ export type AgentRunResult = {
   message: string
   llm_tool_count: number
   mcp_tool_count: number
+  extension_tool_count?: number
   workspace_tool_count?: number
   tools?: unknown[]
   tool_name_map?: Record<string, string>
@@ -71,6 +72,7 @@ export type AgentRunDebugInfo = {
   messages: unknown[]
   llm_tool_count: number
   mcp_tool_count: number
+  extension_tool_count?: number
   workspace_tool_count?: number
   workspace_dir?: string
   default_workspace_dir?: string
@@ -83,6 +85,7 @@ export type SettingsResult = {
   configured: boolean
   workspace_dir: string
   default_workspace_dir?: string
+  browser_tools_mode: BrowserToolsMode
   mcp_url: string
   model_base_url: string
   model_name: string
@@ -94,6 +97,7 @@ export type SettingsResult = {
 }
 
 export type ModelApiType = 'openai' | 'anthropic'
+export type BrowserToolsMode = 'mcp' | 'extension' | 'off'
 
 export type WorkspaceFolder = {
   id: string

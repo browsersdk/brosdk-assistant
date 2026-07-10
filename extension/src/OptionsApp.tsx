@@ -9,7 +9,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { callNative } from './nativeClient'
 import { DEFAULT_SETTINGS, normalizeSettings } from './settings'
-import type { HealthResult, ModelApiType, SettingsResult } from './types'
+import type { BrowserToolsMode, HealthResult, ModelApiType, SettingsResult } from './types'
 
 type SaveState =
   | { kind: 'idle'; text: string }
@@ -126,7 +126,7 @@ export function OptionsApp() {
           <Settings size={18} />
           <div>
             <h2>Assistant Configuration</h2>
-            <p>These settings are saved in the extension and used by the side panel.</p>
+            <p>These settings are saved by the native host and synced to the side panel.</p>
           </div>
         </div>
 
@@ -137,14 +137,31 @@ export function OptionsApp() {
             void saveSettings()
           }}
         >
-          <label htmlFor="mcp-url">MCP URL</label>
-          <input
-            id="mcp-url"
-            value={draftSettings.mcp_url}
-            onChange={(event) => updateDraft('mcp_url', event.target.value)}
-            placeholder={DEFAULT_SETTINGS.mcp_url}
-            required
-          />
+          <label htmlFor="browser-tools-mode">Browser Tools Source</label>
+          <select
+            id="browser-tools-mode"
+            value={draftSettings.browser_tools_mode}
+            onChange={(event) =>
+              updateDraft('browser_tools_mode', event.target.value as BrowserToolsMode)
+            }
+          >
+            <option value="mcp">MCP Server</option>
+            <option value="extension">Chrome Extension</option>
+            <option value="off">Off</option>
+          </select>
+
+          {draftSettings.browser_tools_mode === 'mcp' && (
+            <>
+              <label htmlFor="mcp-url">MCP URL</label>
+              <input
+                id="mcp-url"
+                value={draftSettings.mcp_url}
+                onChange={(event) => updateDraft('mcp_url', event.target.value)}
+                placeholder={DEFAULT_SETTINGS.mcp_url}
+                required
+              />
+            </>
+          )}
 
           <label htmlFor="model-api-type">API Type</label>
           <select

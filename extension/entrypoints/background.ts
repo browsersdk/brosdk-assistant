@@ -95,6 +95,11 @@ export default defineBackground(() => {
         return
       }
 
+      if (message.event === 'extension.tool.request') {
+        void handleExtensionToolRequest(message.payload)
+        return
+      }
+
       void syncSettingsFromNative()
       void chrome.runtime.sendMessage({ type: 'native.event', event: message }).catch(() => undefined)
     })
@@ -145,6 +150,202 @@ export default defineBackground(() => {
 
   function status(): NativeStatus {
     return { connected, lastError }
+  }
+
+  async function handleExtensionToolRequest(payload: unknown) {
+    const request = payload as { id?: string; name?: string; arguments?: unknown }
+    if (!request.id || !request.name) return
+
+    try {
+      const result = await callExtensionBrowserTool(request.name, request.arguments)
+      nativePort?.postMessage({ id: request.id, result })
+    } catch (error) {
+      nativePort?.postMessage({
+        id: request.id,
+        error: {
+          code: 'extension_tool_failed',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      })
+    }
+  }
+
+  async function callExtensionBrowserTool(name: string, args: unknown) {
+    const params = isRecord(args) ? args : {}
+    switch (name) {
+      case 'browser_tabs':
+        return { tabs: (await chrome.tabs.query({})).map(tabSummary) }
+      case 'browser_active_tab':
+        return { tab: tabSummary(await resolveTargetTab(params)) }
+      case 'browser_read_page':
+        return readPage(params)
+      case 'browser_extract_links':
+        return extractLinks(params)
+      case 'browser_navigate':
+        return navigateTab(params)
+      case 'browser_click':
+        return clickPage(params)
+      case 'browser_type':
+        return typeIntoPage(params)
+      default:
+        throw new Error(`Unknown extension browser tool: ${name}`)
+    }
+  }
+
+  function isRecord(value: unknown): value is Record<string, unknown> {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value))
+  }
+
+  function numberParam(params: Record<string, unknown>, key: string) {
+    const value = params[key]
+    return typeof value === 'number' && Number.isInteger(value) ? value : undefined
+  }
+
+  function stringParam(params: Record<string, unknown>, key: string) {
+    const value = params[key]
+    return typeof value === 'string' ? value : undefined
+  }
+
+  function tabSummary(tab: chrome.tabs.Tab) {
+    return {
+      tabId: tab.id,
+      windowId: tab.windowId,
+      index: tab.index,
+      active: tab.active,
+      title: tab.title,
+      url: tab.url,
+      favIconUrl: tab.favIconUrl,
+    }
+  }
+
+  async function resolveTargetTab(params: Record<string, unknown>) {
+    const tabId = numberParam(params, 'tabId')
+    if (typeof tabId === 'number') {
+      return chrome.tabs.get(tabId)
+    }
+
+    const currentWindowTabs = await chrome.tabs.query({ active: true, currentWindow: true })
+    if (currentWindowTabs[0]) return currentWindowTabs[0]
+
+    const lastFocusedTabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
+    if (lastFocusedTabs[0]) return lastFocusedTabs[0]
+
+    throw new Error('No active tab found')
+  }
+
+  async function executeInTab<T>(
+    params: Record<string, unknown>,
+    func: (...args: unknown[]) => T,
+    args: unknown[] = [],
+  ) {
+    const tab = await resolveTargetTab(params)
+    if (typeof tab.id !== 'number') throw new Error('Target tab has no tabId')
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func,
+      args,
+    })
+    return {
+      tab: tabSummary(tab),
+      result: result?.result,
+    }
+  }
+
+  async function readPage(params: Record<string, unknown>) {
+    const maxChars = Math.min(Math.max(numberParam(params, 'maxChars') ?? 12000, 1000), 50000)
+    return executeInTab(
+      params,
+      (limit) => {
+        const text = (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim()
+        return {
+          title: document.title,
+          url: location.href,
+          text: text.slice(0, Number(limit)),
+          truncated: text.length > Number(limit),
+        }
+      },
+      [maxChars],
+    )
+  }
+
+  async function extractLinks(params: Record<string, unknown>) {
+    const maxLinks = Math.min(Math.max(numberParam(params, 'maxLinks') ?? 80, 1), 300)
+    return executeInTab(
+      params,
+      (limit) => {
+        const links = Array.from(document.querySelectorAll('a[href]'))
+          .map((anchor) => {
+            const link = anchor as HTMLAnchorElement
+            return {
+              text: (link.innerText || link.getAttribute('aria-label') || '').trim(),
+              href: link.href,
+            }
+          })
+          .filter((link) => link.href)
+          .slice(0, Number(limit))
+        return { title: document.title, url: location.href, links }
+      },
+      [maxLinks],
+    )
+  }
+
+  async function navigateTab(params: Record<string, unknown>) {
+    const url = stringParam(params, 'url')
+    if (!url) throw new Error('url is required')
+    const tab = await resolveTargetTab(params)
+    if (typeof tab.id !== 'number') throw new Error('Target tab has no tabId')
+    const updated = await chrome.tabs.update(tab.id, { url })
+    return { tab: tabSummary(updated) }
+  }
+
+  async function clickPage(params: Record<string, unknown>) {
+    const selector = stringParam(params, 'selector')
+    const text = stringParam(params, 'text')
+    if (!selector && !text) throw new Error('selector or text is required')
+    return executeInTab(
+      params,
+      (targetSelector, targetText) => {
+        function visibleText(element: Element) {
+          return (element.textContent || '').replace(/\s+/g, ' ').trim()
+        }
+        const element = targetSelector
+          ? document.querySelector(String(targetSelector))
+          : Array.from(
+              document.querySelectorAll('button,a,input,[role="button"],[onclick],summary'),
+            ).find((candidate) =>
+              visibleText(candidate).toLowerCase().includes(String(targetText).toLowerCase()),
+            )
+        if (!(element instanceof HTMLElement)) {
+          throw new Error('Target element not found')
+        }
+        element.scrollIntoView({ block: 'center', inline: 'center' })
+        element.click()
+        return { clicked: true, text: visibleText(element), tag: element.tagName.toLowerCase() }
+      },
+      [selector, text],
+    )
+  }
+
+  async function typeIntoPage(params: Record<string, unknown>) {
+    const selector = stringParam(params, 'selector')
+    const text = stringParam(params, 'text')
+    if (!selector) throw new Error('selector is required')
+    if (text === undefined) throw new Error('text is required')
+    return executeInTab(
+      params,
+      (targetSelector, value) => {
+        const element = document.querySelector(String(targetSelector))
+        if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+          throw new Error('Target is not a text input or textarea')
+        }
+        element.focus()
+        element.value = String(value)
+        element.dispatchEvent(new InputEvent('input', { bubbles: true, data: String(value) }))
+        element.dispatchEvent(new Event('change', { bubbles: true }))
+        return { typed: true, selector: targetSelector }
+      },
+      [selector, text],
+    )
   }
 
   chrome.runtime.onInstalled.addListener(() => {

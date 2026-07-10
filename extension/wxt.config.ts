@@ -7,7 +7,8 @@ export default defineConfig({
     name: 'Brosdk Assistant',
     description: 'Chrome side panel assistant backed by a Rust native host.',
     version: '0.1.0',
-    permissions: ['nativeMessaging', 'sidePanel', 'storage', 'tabs'],
+    permissions: ['nativeMessaging', 'sidePanel', 'storage', 'tabs', 'scripting'],
+    host_permissions: ['<all_urls>'],
     side_panel: {
       default_path: 'sidepanel.html',
     },

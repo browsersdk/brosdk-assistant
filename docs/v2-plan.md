@@ -139,6 +139,7 @@ Initial methods:
 
 Initial persisted settings:
 
+- `browser_tools_mode`
 - `mcp_url`
 - `model_base_url`
 - `model_name`
@@ -193,6 +194,46 @@ Initial events:
 - `agent.done`
 - `agent.error`
 - `tabs.changed`
+
+## Browser Tools Source
+
+The settings page exposes `browser_tools_mode`:
+
+- `mcp`
+  - use the configured MCP URL.
+  - native-host discovers tools with `tools/list` and forwards calls with
+    `tools/call`.
+  - best for CDP-backed browser automation servers.
+- `extension`
+  - do not require MCP or CDP for browser page tools.
+  - native-host exposes built-in `browser_*` tools to the model.
+  - tool calls are sent to the extension background as
+    `extension.tool.request` events over Native Messaging.
+  - the extension executes Chrome API or `chrome.scripting.executeScript`
+    operations and sends the result back through the native port.
+- `off`
+  - expose no browser page tools.
+  - model chat and workspace tools can still work.
+
+Chrome Extension mode currently provides:
+
+- `browser_tabs`
+- `browser_active_tab`
+- `browser_read_page`
+- `browser_extract_links`
+- `browser_navigate`
+- `browser_click`
+- `browser_type`
+
+Chat Mode exposes only read-only extension browser tools. Agent Mode also
+exposes navigation, click, and type tools.
+
+Extension mode is intentionally a lighter fallback than CDP-backed MCP:
+
+- it cannot inject into protected browser pages such as `chrome://` pages.
+- it has weaker frame, accessibility tree, screenshot, download, upload, and
+  file-picker support than CDP.
+- clicks and typing are best-effort DOM operations.
 
 ## MCP Tool Conversion
 
