@@ -31,6 +31,7 @@ import {
 } from './settings'
 import type {
   AgentRunResult,
+  BackgroundRequest,
   ChatMessage,
   FileSystemEntry,
   FileSystemListResult,
@@ -171,6 +172,17 @@ export function App() {
     void checkNative()
     void attachActiveTab()
     void refreshRecentWorkspaces()
+  }, [])
+
+  useEffect(() => {
+    function handleRuntimeMessage(message: BackgroundRequest) {
+      if (message?.type === 'settings.changed') {
+        setSettings(normalizeSettings(message.settings))
+      }
+    }
+
+    chrome.runtime.onMessage.addListener(handleRuntimeMessage)
+    return () => chrome.runtime.onMessage.removeListener(handleRuntimeMessage)
   }, [])
 
   useEffect(() => {
@@ -409,7 +421,6 @@ export function App() {
           title: tab.title,
           url: tab.url,
         })),
-        settings,
       })
       setMessages((current) => [
         ...current,
