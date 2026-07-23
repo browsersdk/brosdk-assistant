@@ -205,7 +205,7 @@ Implemented behavior:
 
 Remaining v0.2.0 work:
 
-- extract agent coordination and tool ownership from `main.rs`.
+- extract tool ownership from `main.rs`.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
 debug traces, page data, and tool results must be chunked or fetched separately
@@ -283,6 +283,9 @@ src/
 
 Current progress:
 
+- `agent/run.rs` owns run and conversation registries, run lifecycle events,
+  cancellation/reset handling, bounded host-owned context, and coordination
+  tests.
 - `protocol.rs` owns Native Messaging request and response types, bounded
   length-prefixed framing, serialized stdout writes, extension response
   correlation, and protocol-specific tests.
