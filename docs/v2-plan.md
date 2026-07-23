@@ -96,7 +96,8 @@ Known limitations:
 
 - protected Chrome pages cannot be scripted,
 - frames and shadow roots are not fully represented,
-- element refs are not yet stable across DOM changes,
+- snapshot refs expire after a newer snapshot, navigation, or target identity
+  change and must be refreshed,
 - click and text input are best-effort DOM operations,
 - screenshot, upload, download, select, scroll, keyboard, and wait tools are not
   implemented yet.
@@ -306,7 +307,12 @@ Current progress:
 - `extension/scripts/test-extension-smoke.mjs` loads a test-mode MV3 build in
   Playwright Chromium and verifies tabs, page reads, snapshots, links, typing,
   clicking, and navigation against a controlled local page. Its internal tool
-  bridge is compiled out of production builds.
+  bridge is compiled out of production builds. The test also verifies stale
+  revision, changed-target, cross-tab, navigation, and DOM-error rejection.
+- the extension background binds each snapshot ref to a Chrome tab id, main
+  document id, and monotonic snapshot revision. Ref actions target the original
+  document through `chrome.scripting` and validate the element's tag, role, and
+  accessible name before acting.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not

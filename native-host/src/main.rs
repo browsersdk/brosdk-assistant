@@ -713,7 +713,7 @@ fn system_prompt(
     let mut prompt = String::from(
         "You are Brosdk Assistant. Use the available tools when they help answer or act for the user.\n\n\
 Browser tool guidance:\n\
-- If browser_* tools are available, use browser_active_tab and browser_read_page for current-page requests. Use browser_snapshot to inspect actionable elements and pass its refs to browser_click or browser_type. Use browser_tabs plus tabId for selected or attached tabs.\n\
+- If browser_* tools are available, use browser_active_tab and browser_read_page for current-page requests. Use browser_snapshot to inspect actionable elements and pass its refs to browser_click or browser_type. Snapshot refs are scoped to the returned tab, document, and latest revision; if a ref expires, call browser_snapshot again instead of guessing. Use browser_tabs plus tabId for selected or attached tabs.\n\
 - If MCP browser tools are available, use tabs with action=\"active\" for current-page requests, then use the returned page id with read/snapshot/grep/act/navigate.\n\
 - For attached/selected tabs with MCP tools, call tabs with action=\"list\" and match attached_tabs[].tabId to pages[].tabId. Use pages[].page for follow-up browser tools.\n\
 - Use read/browser_read_page for page content and snapshot/browser_snapshot/grep/browser_extract_links for page structure when available. Use act/navigate/browser_click/browser_type/browser_navigate only when the user asked you to perform browser actions.\n\
@@ -1148,7 +1148,7 @@ fn extension_browser_tool_definitions(chat_mode: bool) -> Vec<Value> {
         }),
         json!({
             "name": "browser_snapshot",
-            "description": "Return a structured snapshot of interactive page elements through the Chrome extension. Use refs from this result with browser_click or browser_type.",
+            "description": "Return a structured snapshot of interactive page elements through the Chrome extension. Refs are scoped to this tab, document, and snapshot revision. Use refs from the latest result with browser_click or browser_type.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1205,7 +1205,7 @@ fn extension_browser_tool_definitions(chat_mode: bool) -> Vec<Value> {
         }),
         json!({
             "name": "browser_click",
-            "description": "Best-effort click on a page element by snapshot ref, CSS selector, or visible text through the Chrome extension. Prefer refs from browser_snapshot.",
+            "description": "Click a page element by a scoped snapshot ref, CSS selector, or visible text through the Chrome extension. Prefer a ref from the latest browser_snapshot for the same tab. If it expired, take a new snapshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1215,7 +1215,7 @@ fn extension_browser_tool_definitions(chat_mode: bool) -> Vec<Value> {
                     },
                     "ref": {
                         "type": "string",
-                        "description": "Element ref from browser_snapshot, such as e12."
+                        "description": "Scoped element ref from the latest browser_snapshot for this tab, such as t42-r7-e12."
                     },
                     "selector": {
                         "type": "string",
@@ -1230,7 +1230,7 @@ fn extension_browser_tool_definitions(chat_mode: bool) -> Vec<Value> {
         }),
         json!({
             "name": "browser_type",
-            "description": "Best-effort type into an input or textarea by snapshot ref or CSS selector through the Chrome extension. Prefer refs from browser_snapshot.",
+            "description": "Type into an input or textarea by a scoped snapshot ref or CSS selector through the Chrome extension. Prefer a ref from the latest browser_snapshot for the same tab. If it expired, take a new snapshot.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1240,7 +1240,7 @@ fn extension_browser_tool_definitions(chat_mode: bool) -> Vec<Value> {
                     },
                     "ref": {
                         "type": "string",
-                        "description": "Element ref from browser_snapshot, such as e12."
+                        "description": "Scoped element ref from the latest browser_snapshot for this tab, such as t42-r7-e12."
                     },
                     "selector": {
                         "type": "string",

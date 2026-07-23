@@ -77,7 +77,7 @@ Known gaps:
 
 - host-owned conversation state is memory-only and not searchable or persisted,
 - Anthropic is not implemented,
-- extension element refs are not stable across page changes,
+- frames and shadow roots are not fully represented by extension snapshots,
 - destructive actions have no confirmation layer,
 - installation is still a developer-oriented workflow.
 
@@ -145,6 +145,12 @@ Exit criteria:
 
 Goal: make browser actions robust enough for repeated daily use.
 
+Status: in progress. Extension snapshot refs are bound to the source tab,
+Chrome document id, and latest snapshot revision. Stale revisions, changed
+targets, cross-tab reuse, and navigation reuse now fail safely and request a new
+snapshot. DOM script errors are propagated instead of being reported as null
+successes.
+
 - Bind snapshot refs to a tab, document, and revision.
 - Improve controlled-input typing and event dispatch.
 - Add wait, scroll, select, keyboard, tab lifecycle, and screenshot tools.
@@ -208,10 +214,9 @@ The roadmap should be judged by behavior, not feature count:
 
 ## Immediate Implementation Order
 
-1. Bind extension snapshot refs to tab and document revisions.
-2. Improve controlled-input typing, navigation waits, and action diagnostics.
-3. Add wait, scroll, select, keyboard, tab lifecycle, and screenshot tools.
-4. Add confirmation decisions for sensitive browser and workspace mutations.
-5. Expand the controlled browser suite to summaries, forms, navigation, and
+1. Improve controlled-input typing, navigation waits, and action diagnostics.
+2. Add wait, scroll, select, keyboard, tab lifecycle, and screenshot tools.
+3. Add confirmation decisions for sensitive browser and workspace mutations.
+4. Expand the controlled browser suite to summaries, forms, navigation, and
    cancellation.
-6. Harden packaging, security, and cross-platform installation.
+5. Harden packaging, security, and cross-platform installation.

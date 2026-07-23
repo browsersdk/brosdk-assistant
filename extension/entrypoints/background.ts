@@ -15,11 +15,49 @@ const SIDEPANEL_PATH = 'sidepanel.html'
 const LEGACY_SETTINGS_STORAGE_KEY = 'brosdk-assistant-settings'
 const NATIVE_REQUEST_TIMEOUT_MS = 120_000
 
+type DomSnapshotElement = {
+  role: string
+  name: string
+  tag: string
+  text: string
+  selector: string
+  href?: string
+  value?: string
+  placeholder?: string
+  visible: boolean
+}
+
+type DomSnapshotResult = {
+  title: string
+  url: string
+  elements: DomSnapshotElement[]
+  truncated: boolean
+}
+
+type BrowserDomToolResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; error: string }
+
+type SnapshotRefTarget = {
+  selector: string
+  tag: string
+  role: string
+  name: string
+}
+
+type SnapshotState = {
+  documentId: string
+  revision: number
+  refs: Map<string, SnapshotRefTarget>
+}
+
 export default defineBackground(() => {
   let nativePort: chrome.runtime.Port | null = null
   let connected = false
   let lastError: string | undefined
   let cachedSettings: SettingsResult = DEFAULT_SETTINGS
+  let snapshotRevision = 0
+  const snapshotsByTab = new Map<number, SnapshotState>()
   const pending = new Map<
     string,
     {
@@ -224,6 +262,14 @@ export default defineBackground(() => {
     return typeof value === 'string' ? value : undefined
   }
 
+  function unwrapBrowserDomToolResult<T>(result: BrowserDomToolResult<T> | null | undefined) {
+    if (!result || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+      throw new Error('Browser DOM tool returned an invalid result')
+    }
+    if (!result.ok) throw new Error(result.error)
+    return result.value
+  }
+
   function tabSummary(tab: chrome.tabs.Tab) {
     return {
       tabId: tab.id,
@@ -255,26 +301,47 @@ export default defineBackground(() => {
     params: Record<string, unknown>,
     func: (...args: unknown[]) => T,
     args: unknown[] = [],
+    documentId?: string,
   ) {
     const tab = await resolveTargetTab(params)
+    return executeInResolvedTab(tab, func, args, documentId)
+  }
+
+  async function executeInResolvedTab<T>(
+    tab: chrome.tabs.Tab,
+    func: (...args: unknown[]) => T,
+    args: unknown[] = [],
+    documentId?: string,
+  ) {
     if (typeof tab.id !== 'number') throw new Error('Target tab has no tabId')
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+    const target: chrome.scripting.InjectionTarget = { tabId: tab.id }
+    if (documentId) target.documentIds = [documentId]
+    const results = await chrome.scripting.executeScript({
+      target,
       func,
       args,
     })
+    const result = results.find((entry) => entry.frameId === 0) ?? results[0]
+    if (!result) throw new Error('Browser script returned no result')
+    if (result.result === undefined) throw new Error('Browser script returned an empty result')
     return {
       tab: tabSummary(tab),
-      result: result?.result,
+      documentId: result.documentId,
+      result: result.result as T,
     }
   }
 
-  async function executeBrowserDomTool(
+  async function executeBrowserDomTool<T = unknown>(
     params: Record<string, unknown>,
     action: string,
     payload: Record<string, unknown>,
   ) {
-    return executeInTab(params, browserDomTool, [action, payload])
+    const execution = await executeInTab<BrowserDomToolResult<T>>(
+      params,
+      browserDomTool as (...args: unknown[]) => BrowserDomToolResult<T>,
+      [action, payload],
+    )
+    return { ...execution, result: unwrapBrowserDomToolResult(execution.result) }
   }
 
   async function readPage(params: Record<string, unknown>) {
@@ -284,7 +351,36 @@ export default defineBackground(() => {
 
   async function snapshotPage(params: Record<string, unknown>) {
     const maxElements = Math.min(Math.max(numberParam(params, 'maxElements') ?? 120, 10), 500)
-    return executeBrowserDomTool(params, 'snapshot', { maxElements })
+    const execution = await executeBrowserDomTool<DomSnapshotResult>(params, 'snapshot', {
+      maxElements,
+    })
+    const tabId = execution.tab.tabId
+    if (typeof tabId !== 'number') throw new Error('Snapshot tab has no tabId')
+    const revision = ++snapshotRevision
+    const refs = new Map<string, SnapshotRefTarget>()
+    const elements = execution.result.elements.map((element, index) => {
+      const ref = `t${tabId}-r${revision}-e${index + 1}`
+      refs.set(ref, {
+        selector: element.selector,
+        tag: element.tag,
+        role: element.role,
+        name: element.name,
+      })
+      return { ...element, ref }
+    })
+    snapshotsByTab.set(tabId, {
+      documentId: execution.documentId,
+      revision,
+      refs,
+    })
+    return {
+      ...execution,
+      result: {
+        ...execution.result,
+        revision,
+        elements,
+      },
+    }
   }
 
   async function extractLinks(params: Record<string, unknown>) {
@@ -298,7 +394,57 @@ export default defineBackground(() => {
     const tab = await resolveTargetTab(params)
     if (typeof tab.id !== 'number') throw new Error('Target tab has no tabId')
     const updated = await chrome.tabs.update(tab.id, { url })
+    snapshotsByTab.delete(tab.id)
     return { tab: tabSummary(updated) }
+  }
+
+  async function executeSnapshotRef(
+    params: Record<string, unknown>,
+    action: 'click' | 'type',
+    ref: string,
+    payload: Record<string, unknown>,
+  ) {
+    const tab = await resolveTargetTab(params)
+    if (typeof tab.id !== 'number') throw new Error('Target tab has no tabId')
+    const snapshot = snapshotsByTab.get(tab.id)
+    const target = snapshot?.refs.get(ref)
+    if (!snapshot) {
+      throw new Error(
+        `Snapshot ref ${ref} is expired or does not belong to tab ${tab.id}. ` +
+          'Call browser_snapshot again for the target tab.',
+      )
+    }
+    if (!target) {
+      throw new Error(
+        `Snapshot ref ${ref} is not from the latest snapshot revision ` +
+          `${snapshot.revision} for tab ${tab.id}. Call browser_snapshot again.`,
+      )
+    }
+    try {
+      const execution = await executeInResolvedTab<BrowserDomToolResult<unknown>>(
+        tab,
+        browserDomTool as (...args: unknown[]) => BrowserDomToolResult<unknown>,
+        [
+          action,
+          {
+            ...payload,
+            ref,
+            selector: target.selector,
+            expectedTag: target.tag,
+            expectedRole: target.role,
+            expectedName: target.name,
+          },
+        ],
+        snapshot.documentId,
+      )
+      return { ...execution, result: unwrapBrowserDomToolResult(execution.result) }
+    } catch {
+      snapshotsByTab.delete(tab.id)
+      throw new Error(
+        `Snapshot ref ${ref} expired because the page or target element changed. ` +
+          'Call browser_snapshot again for the target tab.',
+      )
+    }
   }
 
   async function clickPage(params: Record<string, unknown>) {
@@ -306,7 +452,8 @@ export default defineBackground(() => {
     const selector = stringParam(params, 'selector')
     const text = stringParam(params, 'text')
     if (!ref && !selector && !text) throw new Error('ref, selector, or text is required')
-    return executeBrowserDomTool(params, 'click', { ref, selector, text })
+    if (ref) return executeSnapshotRef(params, 'click', ref, {})
+    return executeBrowserDomTool(params, 'click', { selector, text })
   }
 
   async function typeIntoPage(params: Record<string, unknown>) {
@@ -315,8 +462,17 @@ export default defineBackground(() => {
     const text = stringParam(params, 'text')
     if (!ref && !selector) throw new Error('ref or selector is required')
     if (text === undefined) throw new Error('text is required')
-    return executeBrowserDomTool(params, 'type', { ref, selector, text })
+    if (ref) return executeSnapshotRef(params, 'type', ref, { text })
+    return executeBrowserDomTool(params, 'type', { selector, text })
   }
+
+  chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+    if (changeInfo.status === 'loading' || changeInfo.url) snapshotsByTab.delete(tabId)
+  })
+
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    snapshotsByTab.delete(tabId)
+  })
 
   chrome.runtime.onInstalled.addListener(() => {
     void chrome.storage.local.remove(LEGACY_SETTINGS_STORAGE_KEY)
@@ -382,7 +538,6 @@ export default defineBackground(() => {
 
 function browserDomTool(actionInput: unknown, payloadInput: unknown) {
   type SnapshotElement = {
-    ref: string
     role: string
     name: string
     tag: string
@@ -520,7 +675,6 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
       const text = visibleText(element)
       if (!visible && !name && !text) continue
       elements.push({
-        ref: `e${elements.length + 1}`,
         role,
         name,
         tag: element.tagName.toLowerCase(),
@@ -547,18 +701,8 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
     }
   }
 
-  function findElement(target: { ref?: string; selector?: string; text?: string }) {
+  function findElement(target: { selector?: string; text?: string }) {
     if (target.selector) return document.querySelector(target.selector)
-    if (target.ref) {
-      const index = Number(target.ref.replace(/^e/, '')) - 1
-      if (Number.isInteger(index) && index >= 0) {
-        const entry = snapshot(500).elements[index]
-        if (entry?.selector) {
-          const element = document.querySelector(entry.selector)
-          if (element) return element
-        }
-      }
-    }
     if (target.text) {
       const needle = target.text.toLowerCase()
       return Array.from(
@@ -568,61 +712,97 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
     return null
   }
 
-  if (action === 'readPage') {
-    const maxChars = numberValue('maxChars', 12000, 1000, 50000)
-    const text = (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim()
+  function assertSnapshotTarget(element: HTMLElement) {
+    const expectedTag = stringValue('expectedTag')
+    const expectedRole = stringValue('expectedRole')
+    const expectedName = stringValue('expectedName')
+    if (expectedTag && element.tagName.toLowerCase() !== expectedTag) {
+      throw new Error('Snapshot target tag changed')
+    }
+    if (expectedRole && inferRole(element) !== expectedRole) {
+      throw new Error('Snapshot target role changed')
+    }
+    if (expectedName && accessibleName(element) !== expectedName) {
+      throw new Error('Snapshot target accessible name changed')
+    }
+  }
+
+  try {
+    if (action === 'readPage') {
+      const maxChars = numberValue('maxChars', 12000, 1000, 50000)
+      const text = (document.body?.innerText || '').replace(/\n{3,}/g, '\n\n').trim()
+      return {
+        ok: true,
+        value: {
+          title: document.title,
+          url: location.href,
+          text: text.slice(0, maxChars),
+          truncated: text.length > maxChars,
+        },
+      }
+    }
+
+    if (action === 'snapshot') {
+      return { ok: true, value: snapshot(numberValue('maxElements', 120, 10, 500)) }
+    }
+
+    if (action === 'extractLinks') {
+      const maxLinks = numberValue('maxLinks', 80, 1, 300)
+      const links = Array.from(document.querySelectorAll('a[href]'))
+        .map((anchor) => {
+          const link = anchor as HTMLAnchorElement
+          return {
+            text: (link.innerText || link.getAttribute('aria-label') || '').trim(),
+            href: link.href,
+          }
+        })
+        .filter((link) => link.href)
+        .slice(0, maxLinks)
+      return { ok: true, value: { title: document.title, url: location.href, links } }
+    }
+
+    if (action === 'click') {
+      const ref = stringValue('ref')
+      const selector = stringValue('selector')
+      const text = stringValue('text')
+      const element = findElement({ selector, text })
+      if (!(element instanceof HTMLElement)) throw new Error('Target element not found')
+      assertSnapshotTarget(element)
+      element.scrollIntoView({ block: 'center', inline: 'center' })
+      element.click()
+      return {
+        ok: true,
+        value: {
+          clicked: true,
+          ref,
+          selector,
+          text: visibleText(element),
+          tag: element.tagName.toLowerCase(),
+        },
+      }
+    }
+
+    if (action === 'type') {
+      const ref = stringValue('ref')
+      const selector = stringValue('selector')
+      const text = stringValue('text')
+      const element = findElement({ selector })
+      if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
+        throw new Error('Target is not a text input or textarea')
+      }
+      assertSnapshotTarget(element)
+      element.focus()
+      element.value = text ?? ''
+      element.dispatchEvent(new InputEvent('input', { bubbles: true, data: text ?? '' }))
+      element.dispatchEvent(new Event('change', { bubbles: true }))
+      return { ok: true, value: { typed: true, ref, selector } }
+    }
+
+    throw new Error(`Unknown browser DOM action: ${action}`)
+  } catch (error) {
     return {
-      title: document.title,
-      url: location.href,
-      text: text.slice(0, maxChars),
-      truncated: text.length > maxChars,
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
     }
   }
-
-  if (action === 'snapshot') {
-    return snapshot(numberValue('maxElements', 120, 10, 500))
-  }
-
-  if (action === 'extractLinks') {
-    const maxLinks = numberValue('maxLinks', 80, 1, 300)
-    const links = Array.from(document.querySelectorAll('a[href]'))
-      .map((anchor) => {
-        const link = anchor as HTMLAnchorElement
-        return {
-          text: (link.innerText || link.getAttribute('aria-label') || '').trim(),
-          href: link.href,
-        }
-      })
-      .filter((link) => link.href)
-      .slice(0, maxLinks)
-    return { title: document.title, url: location.href, links }
-  }
-
-  if (action === 'click') {
-    const ref = stringValue('ref')
-    const selector = stringValue('selector')
-    const text = stringValue('text')
-    const element = findElement({ ref, selector, text })
-    if (!(element instanceof HTMLElement)) throw new Error('Target element not found')
-    element.scrollIntoView({ block: 'center', inline: 'center' })
-    element.click()
-    return { clicked: true, ref, selector, text: visibleText(element), tag: element.tagName.toLowerCase() }
-  }
-
-  if (action === 'type') {
-    const ref = stringValue('ref')
-    const selector = stringValue('selector')
-    const text = stringValue('text')
-    const element = findElement({ ref, selector })
-    if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
-      throw new Error('Target is not a text input or textarea')
-    }
-    element.focus()
-    element.value = text ?? ''
-    element.dispatchEvent(new InputEvent('input', { bubbles: true, data: text ?? '' }))
-    element.dispatchEvent(new Event('change', { bubbles: true }))
-    return { typed: true, ref, selector }
-  }
-
-  throw new Error(`Unknown browser DOM action: ${action}`)
 }

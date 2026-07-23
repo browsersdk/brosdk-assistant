@@ -68,8 +68,8 @@ function closeServer(server) {
   })
 }
 
-async function invokeTool(extensionPage, name, args = {}) {
-  const response = await extensionPage.evaluate(
+async function sendToolRequest(extensionPage, name, args = {}) {
+  return extensionPage.evaluate(
     ({ toolName, toolArgs }) =>
       new Promise((resolveRequest, reject) => {
         chrome.runtime.sendMessage(
@@ -86,8 +86,22 @@ async function invokeTool(extensionPage, name, args = {}) {
       }),
     { toolName: name, toolArgs: args },
   )
+}
+
+async function invokeTool(extensionPage, name, args = {}) {
+  const response = await sendToolRequest(extensionPage, name, args)
   assert.equal(response?.ok, true, response?.error || `${name} failed`)
   return response.data
+}
+
+async function expectToolError(extensionPage, name, args, expected) {
+  const response = await sendToolRequest(extensionPage, name, args)
+  assert.equal(
+    response?.ok,
+    false,
+    `${name} unexpectedly succeeded: ${JSON.stringify(response?.data)}`,
+  )
+  assert.match(response.error || '', expected)
 }
 
 async function run() {
@@ -140,7 +154,9 @@ async function run() {
 
     const tabsResult = await invokeTool(extensionPage, 'browser_tabs')
     const targetTab = tabsResult.tabs.find((tab) => tab.url === pageUrl)
+    const extensionTab = tabsResult.tabs.find((tab) => tab.url?.startsWith('chrome-extension://'))
     assert(targetTab?.tabId, 'controlled page was not returned by browser_tabs')
+    assert(extensionTab?.tabId, 'extension page was not returned by browser_tabs')
     const tabId = targetTab.tabId
 
     await targetPage.bringToFront()
@@ -152,11 +168,51 @@ async function run() {
     assert.equal(readResult.result.title, 'Brosdk Extension Smoke Page')
     assert.match(readResult.result.text, /deterministic page for browser tool verification/i)
 
+    const firstSnapshot = await invokeTool(extensionPage, 'browser_snapshot', { tabId })
+    const firstInput = firstSnapshot.result.elements.find((element) => element.selector === '#query')
+    assert(firstInput?.ref, 'first snapshot did not return the task input')
+    assert.equal(typeof firstSnapshot.documentId, 'string')
+    assert.equal(typeof firstSnapshot.result.revision, 'number')
+    assert.match(
+      firstInput.ref,
+      new RegExp(`^t${tabId}-r${firstSnapshot.result.revision}-e\\d+$`),
+    )
+
+    const secondSnapshot = await invokeTool(extensionPage, 'browser_snapshot', { tabId })
+    assert.equal(secondSnapshot.result.revision, firstSnapshot.result.revision + 1)
+    await expectToolError(
+      extensionPage,
+      'browser_type',
+      { tabId, ref: firstInput.ref, text: 'stale-revision' },
+      /latest snapshot revision/i,
+    )
+
+    const secondButton = secondSnapshot.result.elements.find(
+      (element) => element.selector === '#apply',
+    )
+    assert(secondButton?.ref, 'second snapshot did not return the apply button')
+    await targetPage.locator('#apply').evaluate((button) => {
+      button.textContent = 'Apply updated task'
+    })
+    assert.equal(await targetPage.locator('#apply').textContent(), 'Apply updated task')
+    await expectToolError(
+      extensionPage,
+      'browser_click',
+      { tabId, ref: secondButton.ref },
+      /page or target element changed/i,
+    )
+
     const snapshotResult = await invokeTool(extensionPage, 'browser_snapshot', { tabId })
     const input = snapshotResult.result.elements.find((element) => element.selector === '#query')
     const button = snapshotResult.result.elements.find((element) => element.selector === '#apply')
-    assert(input?.ref, 'snapshot did not return the task input')
-    assert(button?.ref, 'snapshot did not return the apply button')
+    assert(input?.ref, 'latest snapshot did not return the task input')
+    assert(button?.ref, 'latest snapshot did not return the apply button')
+    await expectToolError(
+      extensionPage,
+      'browser_click',
+      { tabId: extensionTab.tabId, ref: button.ref },
+      /does not belong to tab/i,
+    )
 
     const linksResult = await invokeTool(extensionPage, 'browser_extract_links', { tabId })
     assert(
@@ -164,6 +220,12 @@ async function run() {
         (link) => link.text === 'Read the local docs' && link.href === `${pageUrl}docs`,
       ),
       'browser_extract_links did not return the controlled link',
+    )
+    await expectToolError(
+      extensionPage,
+      'browser_click',
+      { tabId, selector: '#missing-target' },
+      /target element not found/i,
     )
 
     await invokeTool(extensionPage, 'browser_type', {
@@ -179,13 +241,21 @@ async function run() {
     await invokeTool(extensionPage, 'browser_navigate', { tabId, url: `${pageUrl}next` })
     await targetPage.waitForURL(`${pageUrl}next`)
     await targetPage.getByRole('heading', { name: 'Navigation complete' }).waitFor()
+    await expectToolError(
+      extensionPage,
+      'browser_click',
+      { tabId, ref: button.ref },
+      /expired|latest browser_snapshot/i,
+    )
     assert.deepEqual(pageErrors, [])
 
     console.log(`PASS browser_tabs extension_id=${extensionId}`)
     console.log('PASS browser_active_tab controlled_page')
     console.log('PASS browser_read_page controlled_content')
-    console.log('PASS browser_snapshot refs')
+    console.log('PASS browser_snapshot tab_document_revision_refs')
+    console.log('PASS stale_revision changed_target cross_tab and navigation_rejection')
     console.log('PASS browser_extract_links controlled_link')
+    console.log('PASS browser DOM errors propagate to the background worker')
     console.log('PASS browser_type and browser_click page_state')
     console.log('PASS browser_navigate controlled_destination')
     console.log('Chrome extension smoke test passed')
@@ -197,6 +267,6 @@ async function run() {
 }
 
 run().catch((error) => {
-  console.error(`Chrome extension smoke test failed: ${error.message}`)
+  console.error(`Chrome extension smoke test failed: ${error.stack || error.message}`)
   process.exitCode = 1
 })

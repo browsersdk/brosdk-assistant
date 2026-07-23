@@ -106,6 +106,9 @@ Browser tools source controls how the assistant reads or acts on browser pages:
 - `Chrome Extension` uses extension APIs and injected scripts, so it can read
   page text, list tabs, snapshot actionable elements, extract links, navigate,
   click, and type without CDP.
+- Snapshot refs are bound to the source tab, document, and latest snapshot
+  revision. Take a new snapshot after navigation, a newer snapshot, or a stale
+  target error.
 - `Off` disables browser page tools while keeping model chat and workspace
   tools available.
 
@@ -131,7 +134,8 @@ opens a controlled local page, and verifies tab discovery, active-tab
 resolution, page reading, actionable-element snapshots, link extraction,
 typing, clicking, and navigation through the real background service worker and
 Chrome extension APIs. The internal test bridge is compiled out of production
-builds.
+builds. Negative checks cover stale revisions, changed elements, cross-tab refs,
+navigation invalidation, and DOM execution errors.
 
 Install the Playwright browser once, then run the test from `extension/`:
 
