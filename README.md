@@ -109,6 +109,10 @@ Browser tools source controls how the assistant reads or acts on browser pages:
 - Snapshot refs are bound to the source tab, document, and latest snapshot
   revision. Take a new snapshot after navigation, a newer snapshot, or a stale
   target error.
+- Text entry uses the native input or textarea value setter and dispatches
+  `beforeinput`, `input`, and `change` for framework-controlled fields.
+- Navigation waits for tab completion up to a bounded timeout and reports its
+  status, final URL, and elapsed time.
 - `Off` disables browser page tools while keeping model chat and workspace
   tools available.
 
@@ -135,7 +139,8 @@ resolution, page reading, actionable-element snapshots, link extraction,
 typing, clicking, and navigation through the real background service worker and
 Chrome extension APIs. The internal test bridge is compiled out of production
 builds. Negative checks cover stale revisions, changed elements, cross-tab refs,
-navigation invalidation, and DOM execution errors.
+navigation invalidation, DOM execution errors, controlled-input events, and
+navigation completion and timeout diagnostics.
 
 Install the Playwright browser once, then run the test from `extension/`:
 

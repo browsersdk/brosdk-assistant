@@ -149,7 +149,8 @@ Status: in progress. Extension snapshot refs are bound to the source tab,
 Chrome document id, and latest snapshot revision. Stale revisions, changed
 targets, cross-tab reuse, and navigation reuse now fail safely and request a new
 snapshot. DOM script errors are propagated instead of being reported as null
-successes.
+successes. Text entry now uses native value setters with controlled-input event
+dispatch, and navigation reports bounded completion or timeout diagnostics.
 
 - Bind snapshot refs to a tab, document, and revision.
 - Improve controlled-input typing and event dispatch.
@@ -214,9 +215,8 @@ The roadmap should be judged by behavior, not feature count:
 
 ## Immediate Implementation Order
 
-1. Improve controlled-input typing, navigation waits, and action diagnostics.
-2. Add wait, scroll, select, keyboard, tab lifecycle, and screenshot tools.
-3. Add confirmation decisions for sensitive browser and workspace mutations.
-4. Expand the controlled browser suite to summaries, forms, navigation, and
+1. Add wait, scroll, select, keyboard, tab lifecycle, and screenshot tools.
+2. Add confirmation decisions for sensitive browser and workspace mutations.
+3. Expand the controlled browser suite to summaries, forms, navigation, and
    cancellation.
-5. Harden packaging, security, and cross-platform installation.
+4. Harden packaging, security, and cross-platform installation.

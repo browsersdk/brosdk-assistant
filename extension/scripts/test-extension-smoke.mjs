@@ -29,13 +29,46 @@ const pageHtml = `<!doctype html>
       <a id="docs-link" href="/docs">Read the local docs</a>
       <label for="query">Task name</label>
       <input id="query" placeholder="Enter a task name">
+      <p id="controlled-status">Controlled: idle</p>
+      <label for="blocked">Blocked field</label>
+      <input id="blocked" placeholder="Input is cancelled">
       <button id="apply" type="button">Apply task</button>
       <p id="status" aria-live="polite">Idle</p>
     </main>
     <script>
+      const query = document.querySelector('#query')
+      const nativeValue = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+      let trackedValue = query.value
+      Object.defineProperty(query, 'value', {
+        configurable: true,
+        get() {
+          return nativeValue.get.call(this)
+        },
+        set(value) {
+          trackedValue = String(value)
+          nativeValue.set.call(this, value)
+        },
+      })
+      const inputEvents = []
+      for (const eventName of ['focus', 'beforeinput', 'input', 'change']) {
+        query.addEventListener(eventName, () => {
+          inputEvents.push(eventName)
+          query.dataset.events = inputEvents.join(',')
+        })
+      }
+      query.addEventListener('input', () => {
+        const domValue = nativeValue.get.call(query)
+        if (domValue !== trackedValue) {
+          trackedValue = domValue
+          document.querySelector('#controlled-status').textContent = 'Controlled: ' + domValue
+        }
+      })
+      document.querySelector('#blocked').addEventListener('beforeinput', (event) => {
+        event.preventDefault()
+      })
       document.querySelector('#apply').addEventListener('click', () => {
         document.querySelector('#status').textContent =
-          'Applied: ' + document.querySelector('#query').value
+          'Applied: ' + query.value
       })
     </script>
   </body>
@@ -49,6 +82,17 @@ const navigatedPageHtml = `<!doctype html>
   </head>
   <body>
     <main><h1>Navigation complete</h1></main>
+  </body>
+</html>`
+
+const slowPageHtml = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Brosdk Slow Page</title>
+  </head>
+  <body>
+    <main><h1>Slow navigation complete</h1></main>
   </body>
 </html>`
 
@@ -114,6 +158,14 @@ async function run() {
     if (request.url === '/next') {
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
       response.end(navigatedPageHtml)
+      return
+    }
+    if (request.url === '/slow') {
+      setTimeout(() => {
+        if (response.destroyed) return
+        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+        response.end(slowPageHtml)
+      }, 400)
       return
     }
     response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
@@ -204,14 +256,24 @@ async function run() {
 
     const snapshotResult = await invokeTool(extensionPage, 'browser_snapshot', { tabId })
     const input = snapshotResult.result.elements.find((element) => element.selector === '#query')
+    const blockedInput = snapshotResult.result.elements.find(
+      (element) => element.selector === '#blocked',
+    )
     const button = snapshotResult.result.elements.find((element) => element.selector === '#apply')
     assert(input?.ref, 'latest snapshot did not return the task input')
+    assert(blockedInput?.ref, 'latest snapshot did not return the blocked input')
     assert(button?.ref, 'latest snapshot did not return the apply button')
     await expectToolError(
       extensionPage,
       'browser_click',
       { tabId: extensionTab.tabId, ref: button.ref },
       /does not belong to tab/i,
+    )
+    await expectToolError(
+      extensionPage,
+      'browser_type',
+      { tabId, ref: blockedInput.ref, text: 'should-not-apply' },
+      /text input was cancelled by the page/i,
     )
 
     const linksResult = await invokeTool(extensionPage, 'browser_extract_links', { tabId })
@@ -228,25 +290,55 @@ async function run() {
       /target element not found/i,
     )
 
-    await invokeTool(extensionPage, 'browser_type', {
+    const typeResult = await invokeTool(extensionPage, 'browser_type', {
       tabId,
       ref: input.ref,
       text: 'extension-smoke',
     })
     assert.equal(await targetPage.locator('#query').inputValue(), 'extension-smoke')
+    await targetPage.getByText('Controlled: extension-smoke').waitFor()
+    assert.equal(
+      await targetPage.locator('#query').getAttribute('data-events'),
+      'focus,beforeinput,input,change',
+    )
+    assert.equal(typeResult.result.diagnostics.valueSetter, 'native-prototype')
+    assert.equal(typeResult.result.diagnostics.controlType, 'input:text')
+    assert.equal(typeResult.result.diagnostics.inputEventType, 'insertReplacementText')
+    assert.equal(typeResult.result.diagnostics.valueLength, 'extension-smoke'.length)
+    assert.deepEqual(typeResult.result.diagnostics.events, ['beforeinput', 'input', 'change'])
 
-    await invokeTool(extensionPage, 'browser_click', { tabId, ref: button.ref })
+    const clickResult = await invokeTool(extensionPage, 'browser_click', { tabId, ref: button.ref })
+    assert.equal(clickResult.result.diagnostics.source, 'snapshot-ref')
+    assert.equal(clickResult.result.diagnostics.target.name, 'Apply updated task')
     await targetPage.getByText('Applied: extension-smoke').waitFor()
 
-    await invokeTool(extensionPage, 'browser_navigate', { tabId, url: `${pageUrl}next` })
-    await targetPage.waitForURL(`${pageUrl}next`)
-    await targetPage.getByRole('heading', { name: 'Navigation complete' }).waitFor()
+    const timedNavigation = await invokeTool(extensionPage, 'browser_navigate', {
+      tabId,
+      url: `${pageUrl}slow`,
+      timeoutMs: 100,
+    })
+    assert.equal(timedNavigation.navigation.status, 'timeout')
+    assert.equal(timedNavigation.navigation.requestedUrl, `${pageUrl}slow`)
+    assert.equal(timedNavigation.navigation.timeoutMs, 100)
+    assert.equal(typeof timedNavigation.navigation.elapsedMs, 'number')
+    await targetPage.waitForURL(`${pageUrl}slow`)
+    await targetPage.getByRole('heading', { name: 'Slow navigation complete' }).waitFor()
     await expectToolError(
       extensionPage,
       'browser_click',
       { tabId, ref: button.ref },
       /expired|latest browser_snapshot/i,
     )
+
+    const completedNavigation = await invokeTool(extensionPage, 'browser_navigate', {
+      tabId,
+      url: `${pageUrl}next`,
+      timeoutMs: 5_000,
+    })
+    assert.equal(completedNavigation.navigation.status, 'complete')
+    assert.equal(completedNavigation.navigation.finalUrl, `${pageUrl}next`)
+    await targetPage.waitForURL(`${pageUrl}next`)
+    await targetPage.getByRole('heading', { name: 'Navigation complete' }).waitFor()
     assert.deepEqual(pageErrors, [])
 
     console.log(`PASS browser_tabs extension_id=${extensionId}`)
@@ -256,8 +348,9 @@ async function run() {
     console.log('PASS stale_revision changed_target cross_tab and navigation_rejection')
     console.log('PASS browser_extract_links controlled_link')
     console.log('PASS browser DOM errors propagate to the background worker')
-    console.log('PASS browser_type and browser_click page_state')
-    console.log('PASS browser_navigate controlled_destination')
+    console.log('PASS browser_type controlled_input_events cancellation and diagnostics')
+    console.log('PASS browser_click target diagnostics and page_state')
+    console.log('PASS browser_navigate timeout complete and final_url diagnostics')
     console.log('Chrome extension smoke test passed')
   } finally {
     await context?.close()

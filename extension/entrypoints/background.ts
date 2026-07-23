@@ -14,6 +14,8 @@ const HOST_NAME = 'com.browsersdk.assistant'
 const SIDEPANEL_PATH = 'sidepanel.html'
 const LEGACY_SETTINGS_STORAGE_KEY = 'brosdk-assistant-settings'
 const NATIVE_REQUEST_TIMEOUT_MS = 120_000
+const DEFAULT_NAVIGATION_TIMEOUT_MS = 15_000
+const MAX_NAVIGATION_TIMEOUT_MS = 60_000
 
 type DomSnapshotElement = {
   role: string
@@ -49,6 +51,12 @@ type SnapshotState = {
   documentId: string
   revision: number
   refs: Map<string, SnapshotRefTarget>
+}
+
+type NavigationWaitResult = {
+  status: 'complete' | 'timeout' | 'closed'
+  elapsedMs: number
+  tab?: chrome.tabs.Tab
 }
 
 export default defineBackground(() => {
@@ -388,14 +396,86 @@ export default defineBackground(() => {
     return executeBrowserDomTool(params, 'extractLinks', { maxLinks })
   }
 
+  function createNavigationWaiter(tabId: number, timeoutMs: number) {
+    const startedAt = Date.now()
+    let settled = false
+    let sawNavigation = false
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    let resolveWait!: (result: NavigationWaitResult) => void
+    const promise = new Promise<NavigationWaitResult>((resolve) => {
+      resolveWait = resolve
+    })
+
+    function cleanup() {
+      if (timeoutId) clearTimeout(timeoutId)
+      chrome.tabs.onUpdated.removeListener(handleUpdated)
+      chrome.tabs.onRemoved.removeListener(handleRemoved)
+    }
+
+    function finish(status: NavigationWaitResult['status'], tab?: chrome.tabs.Tab) {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolveWait({ status, tab, elapsedMs: Date.now() - startedAt })
+    }
+
+    function handleUpdated(updatedTabId: number, changeInfo: chrome.tabs.TabChangeInfo, tab: chrome.tabs.Tab) {
+      if (updatedTabId !== tabId) return
+      if (changeInfo.status === 'loading' || changeInfo.url) sawNavigation = true
+      if (sawNavigation && changeInfo.status === 'complete') finish('complete', tab)
+    }
+
+    function handleRemoved(removedTabId: number) {
+      if (removedTabId === tabId) finish('closed')
+    }
+
+    chrome.tabs.onUpdated.addListener(handleUpdated)
+    chrome.tabs.onRemoved.addListener(handleRemoved)
+    timeoutId = setTimeout(() => finish('timeout'), timeoutMs)
+
+    return {
+      promise,
+      complete(tab: chrome.tabs.Tab) {
+        finish('complete', tab)
+      },
+      cancel() {
+        if (settled) return
+        settled = true
+        cleanup()
+      },
+    }
+  }
+
   async function navigateTab(params: Record<string, unknown>) {
     const url = stringParam(params, 'url')
     if (!url) throw new Error('url is required')
+    const timeoutMs = Math.min(
+      Math.max(numberParam(params, 'timeoutMs') ?? DEFAULT_NAVIGATION_TIMEOUT_MS, 100),
+      MAX_NAVIGATION_TIMEOUT_MS,
+    )
     const tab = await resolveTargetTab(params)
     if (typeof tab.id !== 'number') throw new Error('Target tab has no tabId')
-    const updated = await chrome.tabs.update(tab.id, { url })
-    snapshotsByTab.delete(tab.id)
-    return { tab: tabSummary(updated) }
+    const waiter = createNavigationWaiter(tab.id, timeoutMs)
+    try {
+      const updated = await chrome.tabs.update(tab.id, { url })
+      snapshotsByTab.delete(tab.id)
+      if (updated.status === 'complete') waiter.complete(updated)
+      const navigation = await waiter.promise
+      const finalTab = navigation.tab ?? (await chrome.tabs.get(tab.id).catch(() => updated))
+      return {
+        tab: tabSummary(finalTab),
+        navigation: {
+          requestedUrl: url,
+          finalUrl: finalTab.url,
+          status: navigation.status,
+          elapsedMs: navigation.elapsedMs,
+          timeoutMs,
+        },
+      }
+    } catch (error) {
+      waiter.cancel()
+      throw error
+    }
   }
 
   async function executeSnapshotRef(
@@ -420,8 +500,9 @@ export default defineBackground(() => {
           `${snapshot.revision} for tab ${tab.id}. Call browser_snapshot again.`,
       )
     }
+    let execution
     try {
-      const execution = await executeInResolvedTab<BrowserDomToolResult<unknown>>(
+      execution = await executeInResolvedTab<BrowserDomToolResult<unknown>>(
         tab,
         browserDomTool as (...args: unknown[]) => BrowserDomToolResult<unknown>,
         [
@@ -437,7 +518,6 @@ export default defineBackground(() => {
         ],
         snapshot.documentId,
       )
-      return { ...execution, result: unwrapBrowserDomToolResult(execution.result) }
     } catch {
       snapshotsByTab.delete(tab.id)
       throw new Error(
@@ -445,6 +525,25 @@ export default defineBackground(() => {
           'Call browser_snapshot again for the target tab.',
       )
     }
+    const result = execution.result
+    if (!result || typeof result !== 'object' || typeof result.ok !== 'boolean') {
+      snapshotsByTab.delete(tab.id)
+      throw new Error(
+        `Snapshot ref ${ref} returned an invalid page result. ` +
+          'Call browser_snapshot again for the target tab.',
+      )
+    }
+    if (!result.ok) {
+      if (/^(Snapshot target|Target element not found)/.test(result.error)) {
+        snapshotsByTab.delete(tab.id)
+        throw new Error(
+          `Snapshot ref ${ref} expired because the page or target element changed. ` +
+            'Call browser_snapshot again for the target tab.',
+        )
+      }
+      throw new Error(result.error)
+    }
+    return { ...execution, result: result.value }
   }
 
   async function clickPage(params: Record<string, unknown>) {
@@ -564,6 +663,11 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
   function stringValue(key: string) {
     const value = payload[key]
     return typeof value === 'string' && value.trim() ? value : undefined
+  }
+
+  function rawStringValue(key: string) {
+    const value = payload[key]
+    return typeof value === 'string' ? value : undefined
   }
 
   function visibleText(element: Element) {
@@ -727,6 +831,56 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
     }
   }
 
+  function setNativeTextValue(element: HTMLInputElement | HTMLTextAreaElement, text: string) {
+    if (
+      element instanceof HTMLInputElement &&
+      ['button', 'checkbox', 'color', 'file', 'hidden', 'image', 'radio', 'range', 'reset', 'submit'].includes(
+        element.type,
+      )
+    ) {
+      throw new Error(`Input type ${element.type} does not accept browser_type text`)
+    }
+    const prototype =
+      element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
+    const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value')
+    if (!descriptor?.set) throw new Error('Native text value setter is unavailable')
+
+    const previousValueLength = element.value.length
+    element.focus()
+    try {
+      element.select()
+    } catch {
+      // Some input types do not support text selection.
+    }
+    const inputType = 'insertReplacementText'
+    const beforeInput = new InputEvent('beforeinput', {
+      bubbles: true,
+      cancelable: true,
+      data: text,
+      inputType,
+    })
+    if (!element.dispatchEvent(beforeInput)) throw new Error('Text input was cancelled by the page')
+    descriptor.set.call(element, text)
+    element.dispatchEvent(
+      new InputEvent('input', {
+        bubbles: true,
+        data: text,
+        inputType,
+      }),
+    )
+    element.dispatchEvent(new Event('change', { bubbles: true }))
+    return {
+      controlType:
+        element instanceof HTMLTextAreaElement ? 'textarea' : `input:${element.type || 'text'}`,
+      inputEventType: inputType,
+      previousValueLength,
+      valueLength: element.value.length,
+      focused: document.activeElement === element,
+      valueSetter: 'native-prototype',
+      events: ['beforeinput', 'input', 'change'],
+    }
+  }
+
   try {
     if (action === 'readPage') {
       const maxChars = numberValue('maxChars', 12000, 1000, 50000)
@@ -768,6 +922,11 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
       const element = findElement({ selector, text })
       if (!(element instanceof HTMLElement)) throw new Error('Target element not found')
       assertSnapshotTarget(element)
+      const target = {
+        tag: element.tagName.toLowerCase(),
+        role: inferRole(element),
+        name: accessibleName(element),
+      }
       element.scrollIntoView({ block: 'center', inline: 'center' })
       element.click()
       return {
@@ -778,6 +937,10 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
           selector,
           text: visibleText(element),
           tag: element.tagName.toLowerCase(),
+          diagnostics: {
+            source: ref ? 'snapshot-ref' : selector ? 'selector' : 'visible-text',
+            target,
+          },
         },
       }
     }
@@ -785,17 +948,32 @@ function browserDomTool(actionInput: unknown, payloadInput: unknown) {
     if (action === 'type') {
       const ref = stringValue('ref')
       const selector = stringValue('selector')
-      const text = stringValue('text')
+      const text = rawStringValue('text')
       const element = findElement({ selector })
+      if (!(element instanceof HTMLElement)) throw new Error('Target element not found')
+      assertSnapshotTarget(element)
       if (!(element instanceof HTMLInputElement || element instanceof HTMLTextAreaElement)) {
         throw new Error('Target is not a text input or textarea')
       }
-      assertSnapshotTarget(element)
-      element.focus()
-      element.value = text ?? ''
-      element.dispatchEvent(new InputEvent('input', { bubbles: true, data: text ?? '' }))
-      element.dispatchEvent(new Event('change', { bubbles: true }))
-      return { ok: true, value: { typed: true, ref, selector } }
+      const target = {
+        tag: element.tagName.toLowerCase(),
+        role: inferRole(element),
+        name: accessibleName(element),
+      }
+      const diagnostics = setNativeTextValue(element, text ?? '')
+      return {
+        ok: true,
+        value: {
+          typed: true,
+          ref,
+          selector,
+          diagnostics: {
+            source: ref ? 'snapshot-ref' : 'selector',
+            target,
+            ...diagnostics,
+          },
+        },
+      }
     }
 
     throw new Error(`Unknown browser DOM action: ${action}`)

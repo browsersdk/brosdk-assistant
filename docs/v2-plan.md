@@ -98,7 +98,7 @@ Known limitations:
 - frames and shadow roots are not fully represented,
 - snapshot refs expire after a newer snapshot, navigation, or target identity
   change and must be refreshed,
-- click and text input are best-effort DOM operations,
+- click remains a best-effort DOM operation,
 - screenshot, upload, download, select, scroll, keyboard, and wait tools are not
   implemented yet.
 
@@ -308,11 +308,17 @@ Current progress:
   Playwright Chromium and verifies tabs, page reads, snapshots, links, typing,
   clicking, and navigation against a controlled local page. Its internal tool
   bridge is compiled out of production builds. The test also verifies stale
-  revision, changed-target, cross-tab, navigation, and DOM-error rejection.
+  revision, changed-target, cross-tab, navigation, and DOM-error rejection,
+  controlled-input events, and navigation completion and timeout diagnostics.
 - the extension background binds each snapshot ref to a Chrome tab id, main
   document id, and monotonic snapshot revision. Ref actions target the original
   document through `chrome.scripting` and validate the element's tag, role, and
   accessible name before acting.
+- text entry bypasses framework value trackers through the native input or
+  textarea setter, dispatches `beforeinput`, `input`, and `change`, and returns
+  bounded diagnostics without echoing the entered text.
+- navigation listens for tab loading and completion, applies a bounded timeout,
+  and returns `complete`, `timeout`, or `closed` with final URL and elapsed time.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not
