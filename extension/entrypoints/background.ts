@@ -13,6 +13,7 @@ import type {
 const HOST_NAME = 'com.browsersdk.assistant'
 const SIDEPANEL_PATH = 'sidepanel.html'
 const LEGACY_SETTINGS_STORAGE_KEY = 'brosdk-assistant-settings'
+const NATIVE_REQUEST_TIMEOUT_MS = 120_000
 
 export default defineBackground(() => {
   let nativePort: chrome.runtime.Port | null = null
@@ -24,6 +25,7 @@ export default defineBackground(() => {
     {
       resolve: (value: unknown) => void
       reject: (error: Error) => void
+      timeoutId: ReturnType<typeof setTimeout>
     }
   >()
 
@@ -87,6 +89,7 @@ export default defineBackground(() => {
         const waiter = pending.get(message.id)
         if (!waiter) return
         pending.delete(message.id)
+        clearTimeout(waiter.timeoutId)
         if (message.error) {
           waiter.reject(new Error(message.error.message))
         } else {
@@ -100,7 +103,9 @@ export default defineBackground(() => {
         return
       }
 
-      void syncSettingsFromNative()
+      if (message.event === 'native.ready') {
+        void syncSettingsFromNative()
+      }
       void chrome.runtime.sendMessage({ type: 'native.event', event: message }).catch(() => undefined)
     })
 
@@ -110,6 +115,7 @@ export default defineBackground(() => {
       connected = false
       lastError = error
       for (const waiter of pending.values()) {
+        clearTimeout(waiter.timeoutId)
         waiter.reject(new Error(error))
       }
       pending.clear()
@@ -123,8 +129,18 @@ export default defineBackground(() => {
     }
 
     return new Promise((resolve, reject) => {
-      pending.set(request.id, { resolve, reject })
-      nativePort?.postMessage(request)
+      const timeoutId = setTimeout(() => {
+        pending.delete(request.id)
+        reject(new Error(`Native request timed out: ${request.method}`))
+      }, NATIVE_REQUEST_TIMEOUT_MS)
+      pending.set(request.id, { resolve, reject, timeoutId })
+      try {
+        nativePort?.postMessage(request)
+      } catch (error) {
+        clearTimeout(timeoutId)
+        pending.delete(request.id)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      }
     })
   }
 

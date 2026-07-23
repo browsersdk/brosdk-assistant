@@ -30,6 +30,10 @@ export type BackgroundRequest =
       type: 'settings.changed'
       settings: SettingsResult
     }
+  | {
+      type: 'native.event'
+      event: NativeEvent
+    }
 
 export type BackgroundResponse<T = unknown> = {
   ok: boolean
@@ -63,6 +67,24 @@ export type AgentRunResult = {
   tools?: unknown[]
   tool_name_map?: Record<string, string>
   debug?: AgentRunDebugInfo
+}
+
+export type AgentStartResult = {
+  run_id: string
+  state: 'queued'
+}
+
+export type AgentEventPayload = {
+  run_id: string
+  state?: string
+  result?: AgentRunResult
+  error?: {
+    code: string
+    message: string
+  }
+  tool_call_id?: string
+  tool_name?: string
+  ok?: boolean
 }
 
 export type AgentRunDebugInfo = {

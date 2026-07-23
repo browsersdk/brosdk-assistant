@@ -59,6 +59,7 @@ button {
 }
 
 .chat-header,
+.header-identity,
 .provider-button,
 .header-actions,
 .brand,
@@ -85,6 +86,11 @@ button {
   backdrop-filter: blur(14px);
 }
 
+.header-identity {
+  min-width: 0;
+  gap: 6px;
+}
+
 .provider-button {
   min-width: 0;
   gap: 8px;
@@ -94,6 +100,55 @@ button {
   cursor: pointer;
   font-weight: 700;
   padding: 8px;
+}
+
+.mode-status-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 132px;
+  min-height: 26px;
+  flex: 0 1 auto;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-tint);
+  color: var(--muted);
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.mode-status-chip > span:last-of-type {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mode-status-chip strong {
+  color: var(--text);
+  font-size: 10px;
+  letter-spacing: 0;
+}
+
+.mode-status-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 6px;
+  border-radius: 999px;
+  background: var(--muted);
+}
+
+.mode-status-chip.source-extension .mode-status-dot {
+  background: var(--green);
+}
+
+.mode-status-chip.source-mcp .mode-status-dot {
+  background: var(--accent);
+}
+
+.mode-status-chip.source-off .mode-status-dot {
+  background: var(--border-strong);
 }
 
 .provider-button:hover,
@@ -983,9 +1038,19 @@ textarea {
 
 .send-button:disabled,
 .icon-button:disabled {
-  cursor: wait;
+  cursor: default;
   opacity: 0.6;
   transform: none;
+}
+
+.working-spinner {
+  animation: working-spin 900ms linear infinite;
+}
+
+@keyframes working-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .options-shell {

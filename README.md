@@ -1,8 +1,11 @@
 # Brosdk Assistant
 
-Chrome side-panel assistant backed by a Rust Native Messaging host.
+Local-first Chrome side-panel assistant backed by a Rust Native Messaging host.
 
-Read `docs/v2-plan.md` first for architecture and implementation notes.
+Start with:
+
+- `docs/roadmap.md` for product direction, milestones, and release gates.
+- `docs/v2-plan.md` for current and target architecture.
 
 ## Structure
 
@@ -78,7 +81,7 @@ The side panel Settings panel stores these values through the Rust native host:
 
 - browser tools source: MCP Server, Chrome Extension, or Off
 - MCP URL, required only when browser tools source is MCP Server
-- model API type
+- model API type; OpenAI-compatible APIs are supported and Anthropic is planned
 - model base URL
 - model name
 - model API key
@@ -93,6 +96,7 @@ On Windows, native-host settings are saved under:
 
 Browser tools source controls how the assistant reads or acts on browser pages:
 
+- `Chrome Extension` is the default for new installations.
 - `MCP Server` uses the configured MCP URL and is best when a CDP-backed MCP
   server is running.
 - `Chrome Extension` uses extension APIs and injected scripts, so it can read
@@ -106,3 +110,34 @@ Browser tools source controls how the assistant reads or acts on browser pages:
 The Rust host can be tested without Chrome by sending length-prefixed JSON to
 stdin. The extension background uses the same framing through
 `chrome.runtime.connectNative("com.browsersdk.assistant")`.
+
+## DeepSeek End-to-End Test
+
+The real-provider E2E test starts the native host with a temporary settings
+directory and verifies Native Messaging, settings persistence, an OpenAI-
+compatible model request, a scoped workspace tool call, and multi-turn context.
+The API key is read only from the environment and is not written to the
+repository.
+
+The test also verifies the asynchronous `agent.start` protocol, concurrent
+`agent.health` routing during a model run, tool progress events, and
+`agent.cancel` acknowledgement.
+
+```powershell
+$env:DEEPSEEK_API_KEY = "<temporary-api-key>"
+python scripts\test_deepseek_e2e.py --model deepseek-v4-flash
+Remove-Item Env:DEEPSEEK_API_KEY
+```
+
+Optional environment variables:
+
+- `DEEPSEEK_BASE_URL`, default `https://api.deepseek.com`
+- `DEEPSEEK_MODEL`, default `deepseek-v4-flash`
+
+The Anthropic-compatible DeepSeek endpoint is not tested until the native host
+has an Anthropic Messages API adapter.
+
+Validated on 2026-07-23 with:
+
+- `deepseek-v4-flash`
+- `deepseek-v4-pro`

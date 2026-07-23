@@ -1,221 +1,87 @@
-# Brosdk Assistant V2 Plan
+# Brosdk Assistant Architecture Plan
 
-This is the implementation plan for the new `brosdk-assistant` project.
+This document describes the current architecture, the target architecture, and
+the engineering rules for the next implementation phase. Product priorities and
+release milestones live in [roadmap.md](roadmap.md).
 
-## Goals
+## Product Boundary
 
-- Build a Chrome side-panel assistant that starts its local agent through Chrome
-  Native Messaging.
-- Replace the manual Python HTTP service startup from v1 with a Rust native
-  host process managed by Chrome.
-- Keep the extension UI responsive and event-driven.
-- Use an original `message-bot` style icon inspired by common message and bot
-  icon patterns, without copying Font Awesome assets.
-- Keep product identity, source code, and UI implementation independent.
+Brosdk Assistant is a local-first Chrome side-panel assistant.
 
-## Architecture
+The default experience must work with only:
+
+- the Chrome extension,
+- the native messaging host, and
+- a user-configured model API.
+
+MCP servers and filesystem workspaces are optional capability sources. The
+product does not depend on BrowserOS APIs and does not attempt to reproduce the
+BrowserOS product.
+
+## Product Contract
+
+The primary workflow is:
+
+1. Install the extension and native host.
+2. Configure a supported model endpoint.
+3. Ask about the current page without starting another browser service.
+4. Switch to Agent Mode only when browser or workspace mutations are needed.
+5. Attach tabs for an explicit multi-tab task.
+6. Select a workspace only when local file access is useful.
+
+The UI and documentation must not advertise an API provider, tool, mode, or
+control before its execution path works end to end.
+
+## Current Architecture
 
 ```text
-Chrome side panel React UI
+Chrome side panel (React)
   -> extension background service worker
   -> chrome.runtime.connectNative("com.browsersdk.assistant")
   -> Rust native host
-  -> MCP / browser automation / LLM / workspace tools
+       -> model API
+       -> optional MCP server
+       -> scoped workspace tools
+       -> extension browser-tool round trips
 ```
 
-The extension should not open a localhost HTTP server by default. Native
-Messaging is the primary transport between Chrome and the local agent.
+### Extension responsibilities
 
-## Process Model
+- Render the side-panel conversation and options page.
+- Own Chrome tabs, side-panel, storage, and scripting APIs.
+- Maintain the Native Messaging port in the background service worker.
+- Execute built-in `browser_*` tools when Chrome Extension mode is selected.
+- Store UI-only state such as recent workspace shortcuts.
+- Never persist model credentials or agent configuration in extension storage.
 
-Chrome starts the Rust native host when the background service worker calls:
+### Native-host responsibilities
 
-```ts
-chrome.runtime.connectNative('com.browsersdk.assistant')
-```
+- Persist and validate settings.
+- Call supported model APIs.
+- Discover and invoke tools from a generic MCP server.
+- Convert MCP schemas to provider-compatible tool definitions.
+- Enforce Chat Mode and workspace boundaries.
+- Execute scoped workspace tools.
+- Coordinate agent runs and browser-tool requests.
 
-The host communicates with Chrome over stdin/stdout using the Native Messaging
-framing format:
+### Settings ownership
 
-- 4-byte little-endian unsigned message length.
-- UTF-8 JSON payload.
-- Host logs must go to stderr or a log file, never stdout.
-
-Chrome limits messages from the native host to 1 MB each, so streaming content
-must be chunked.
-
-## Extension Structure
-
-Current files:
-
-- `extension/entrypoints/background.ts`
-  - Owns the native port.
-  - Reconnects on disconnect.
-  - Routes request/response ids.
-  - Broadcasts host events to side-panel views.
-  - Configures global side-panel behavior.
-  - Syncs settings from the native host after the native port connects.
-- `extension/entrypoints/sidepanel/`
-  - React side-panel entrypoint.
-- `extension/entrypoints/settings/`
-  - Full-page extension settings entrypoint.
-  - Replaces the old embedded `options_ui` popup because the configuration UI
-    needs more horizontal and vertical space than Chrome's options popup gives.
-- `extension/src/nativeClient.ts`
-  - Side-panel client for background RPC/events.
-- `extension/src/App.tsx`
-  - Main UI.
-- `extension/src/types.ts`
-  - Shared protocol and UI types.
-- `extension/public/icons/`
-  - Generated extension icons.
-
-## Rust Native Host Structure
-
-Planned files:
-
-- `native-host/src/main.rs`
-  - Native Messaging read/write loop.
-  - JSON-RPC style request dispatcher.
-  - Event sender.
-- `native-host/native-host-manifest.example.json`
-  - Chrome native host manifest template.
-- `native-host/scripts/install-windows.ps1`
-  - Writes the native host manifest and registry key for Chrome.
-
-Future modules can split into:
-
-- `protocol`
-- `settings`
-- `mcp`
-- `agent`
-- `workspace`
-- `tabs`
-
-## Protocol
-
-Use a JSON-RPC-like envelope over Native Messaging.
-
-Request:
-
-```json
-{ "id": "1", "method": "agent.health", "params": {} }
-```
-
-Response:
-
-```json
-{ "id": "1", "result": { "ok": true, "service": "brosdk-assistant-native" } }
-```
-
-Error response:
-
-```json
-{ "id": "1", "error": { "code": "unknown_method", "message": "Unknown method" } }
-```
-
-Event:
-
-```json
-{ "event": "agent.status", "payload": { "state": "ready" } }
-```
-
-Initial methods:
-
-- `agent.health`
-- `agent.echo`
-- `agent.run`
-- `agent.tools`
-- `llm.tools`
-- `agent.cancel`
-- `agent.reset`
-- `tabs.list`
-- `tabs.active`
-- `filesystem.roots`
-- `filesystem.list`
-- `workspace.set`
-- `settings.get`
-- `settings.set`
-
-Initial persisted settings:
-
-- `browser_tools_mode`
-- `mcp_url`
-- `model_base_url`
-- `model_name`
-- `model_api_type`
-- `api_key`
-- `temperature`
-- `workspace_dir`
-
-The first Rust implementation stores settings in the user profile:
+The native host is the single source of truth for configuration.
 
 - Windows: `%APPDATA%\BrosdkAssistant\settings.json`
 - Other platforms: `$HOME/BrosdkAssistant/settings.json`
 
-The native host is the single source of truth for persisted configuration. The
-extension must not persist model, MCP, API key, side-panel, or workspace
-configuration in `chrome.storage.local`.
+The extension may store recent-folder shortcuts, but not API keys, model
+settings, MCP settings, side-panel behavior, or the selected workspace.
 
-Current extension behavior:
+## Browser Tool Sources
 
-- Settings page load:
-  - call `settings.get` through Native Messaging.
-  - populate the form from the native response.
-  - show an error if the native host is not connected.
-- Settings page save:
-  - call `settings.set`.
-  - notify the background script with an in-memory `settings.changed` message so
-    side-panel behavior can update immediately.
-- Background startup / native ready:
-  - call `settings.get`.
-  - update cached side-panel behavior from the native response.
-- Legacy cleanup:
-  - remove the old `chrome.storage.local` key `brosdk-assistant-settings`.
+### Chrome Extension
 
-The extension may still use `chrome.storage.local` for UI-only state, such as
-recent workspace folder shortcuts. That UI memory is not configuration.
+This is the default for new installations. It requires no CDP connection or
+external MCP process.
 
-Workspace defaults:
-
-- `workspace_dir = "."` means the native default workspace.
-- Native default workspace:
-  - Windows: `%APPDATA%\BrosdkAssistant\workspace`
-  - Other platforms: `$HOME/BrosdkAssistant/workspace` equivalent under the
-    native settings base directory.
-- `workspace_dir = ""` means "No workspace"; local workspace tools are not
-  exposed to the model.
-
-Initial events:
-
-- `native.ready`
-- `agent.status`
-- `agent.delta`
-- `agent.done`
-- `agent.error`
-- `tabs.changed`
-
-## Browser Tools Source
-
-The settings page exposes `browser_tools_mode`:
-
-- `mcp`
-  - use the configured MCP URL.
-  - native-host discovers tools with `tools/list` and forwards calls with
-    `tools/call`.
-  - best for CDP-backed browser automation servers.
-- `extension`
-  - do not require MCP or CDP for browser page tools.
-  - native-host exposes built-in `browser_*` tools to the model.
-  - tool calls are sent to the extension background as
-    `extension.tool.request` events over Native Messaging.
-  - the extension executes Chrome API or `chrome.scripting.executeScript`
-    operations and sends the result back through the native port.
-- `off`
-  - expose no browser page tools.
-  - model chat and workspace tools can still work.
-
-Chrome Extension mode currently provides:
+Current tools:
 
 - `browser_tabs`
 - `browser_active_tab`
@@ -226,190 +92,211 @@ Chrome Extension mode currently provides:
 - `browser_click`
 - `browser_type`
 
-Chat Mode exposes only read-only extension browser tools. Agent Mode also
-exposes navigation, click, and type tools.
+Known limitations:
 
-`browser_snapshot` returns interactive elements with refs such as `e12`.
-`browser_click` and `browser_type` should prefer those refs over CSS selectors
-or text matching.
+- protected Chrome pages cannot be scripted,
+- frames and shadow roots are not fully represented,
+- element refs are not yet stable across DOM changes,
+- click and text input are best-effort DOM operations,
+- screenshot, upload, download, select, scroll, keyboard, and wait tools are not
+  implemented yet.
 
-Extension mode is intentionally a lighter fallback than CDP-backed MCP:
+### MCP Server
 
-- it cannot inject into protected browser pages such as `chrome://` pages.
-- it has weaker frame, accessibility tree, screenshot, download, upload, and
-  file-picker support than CDP.
-- clicks and typing are best-effort DOM operations.
+MCP is an optional advanced mode. The native host must remain server-agnostic:
 
-## MCP Tool Conversion
+- initialize a Streamable HTTP session,
+- discover tools with `tools/list`,
+- invoke tools with `tools/call`,
+- map provider-safe tool names back to original MCP names,
+- use MCP tool metadata when enforcing read-only behavior.
 
-The Rust native host owns MCP tool discovery and LLM tool conversion. The
-extension should not convert MCP tools itself.
+Changing an MCP server must not require changes to the native host unless the
+server violates or extends the MCP protocol.
 
-Current flow:
+### Off
 
-```text
-agent.run / agent.tools / llm.tools
-  -> initialize MCP Streamable HTTP session
-  -> notifications/initialized
-  -> tools/list
-  -> sanitize MCP tool names for OpenAI-compatible function names
-  -> convert each MCP tool to:
-     { type: "function", function: { name, description, parameters } }
-  -> return tool_name_map so safe LLM tool names can be mapped back to MCP names
-```
+No browser tools are exposed. Model chat and an explicitly selected workspace
+remain available.
 
-Tool name constraints follow OpenAI-compatible function calling requirements:
+## Target Interaction Modes
 
-```text
-^[a-zA-Z0-9_-]+$
-```
+| Capability | Chat Mode | Agent Mode |
+| --- | --- | --- |
+| Read current or attached pages | Yes | Yes |
+| Read/search workspace | Yes | Yes |
+| Navigate, click, or type | No | Yes |
+| Write or edit workspace files | No | Yes |
+| Unknown MCP tools | Deny unless read-only | Allowed by policy |
+| Sensitive action confirmation | Not applicable | Required before execution |
 
-Names containing `/`, `.`, `:`, spaces, or other invalid characters are replaced
-with `_` and receive a short SHA-1 suffix when needed. The safe name length is
-capped at 64 characters.
+The native host enforces these rules. Hiding a tool in the UI is not a security
+boundary.
 
-The native host should remain MCP-server agnostic:
+## Workspace Model
 
-- It discovers tools with `tools/list`.
-- It forwards tool calls through `tools/call`.
-- It does not require vendor-specific browser APIs.
-- It keeps a `tool_name_map` to map OpenAI-safe function names back to original
-  MCP tool names.
+- `workspace_dir = "."` resolves to the isolated native default workspace.
+- `workspace_dir = ""` means no workspace and exposes no workspace tools.
+- Any other value must resolve to an existing directory selected by the user.
+- Tool paths are relative to the selected workspace.
+- Absolute paths, parent traversal, and symlink escapes are rejected.
 
-Chat Mode applies a conservative compatibility layer for known browser MCP
-tools:
-
-- Known read-only browser tools are exposed.
-- Known mutating browser tools such as `act`, `navigate`, `upload`, `download`,
-  `run`, and `evaluate` are hidden.
-- `tabs` remains available, but only `action="list"` and `action="active"` are
-  allowed.
-- Unknown external MCP tools are left available for compatibility unless a later
-  policy decides to require `annotations.readOnlyHint`.
-
-## Tab Strategy
-
-The extension can still read Chrome tabs directly for UI context because Chrome
-tab activation is an extension-level event. The native host should expose tabs
-methods for future non-extension contexts, but the first version can return
-placeholder data until browser/MCP integration is added.
-
-Attached tabs are UI context, not page content. The extension sends selected
-tabs as:
-
-```json
-{ "tabId": 123, "title": "Example", "url": "https://example.com" }
-```
-
-For browser-control MCP servers, the model should call `tabs` with
-`action="list"` and match:
-
-```text
-attached_tabs[].tabId == pages[].tabId
-```
-
-The MCP `pages[].page` value is the page id to pass to `read`, `snapshot`,
-`grep`, `act`, or `navigate`.
-
-For "current page" requests, attached tabs are not required; the model should
-use `tabs` with `action="active"` and then read the returned page id.
-
-## Workspace Tools
-
-The native host exposes scoped local workspace tools only when a workspace is
-selected or when the default workspace is active.
-
-Agent Mode workspace tools:
+Chat Mode exposes:
 
 - `workspace_ls`
 - `workspace_read_file`
+- `workspace_search`
+
+Agent Mode additionally exposes:
+
 - `workspace_write_file`
 - `workspace_edit_file`
-- `workspace_search`
 
-Chat Mode workspace tools:
+## Conversation and Run Protocol
 
-- `workspace_ls`
-- `workspace_read_file`
-- `workspace_search`
+### Current run protocol
 
-All workspace paths must be relative to the selected workspace. The native host
-rejects:
+Starting a run returns a `run_id` immediately:
 
-- absolute paths.
-- `..` parent traversal.
-- canonical paths that resolve outside the workspace.
-- symlink escapes outside the workspace.
+```json
+{
+  "id": "request-1",
+  "result": { "run_id": "run-1", "state": "queued" }
+}
+```
 
-The default workspace is created by the native host when needed. Selecting
-"No workspace" disables workspace tools entirely.
+The host then emits bounded events:
 
-## Chat Mode vs Agent Mode
+- `agent.status`
+- `agent.tool.started`
+- `agent.tool.finished`
+- `agent.done`
+- `agent.error`
+- `agent.cancelled`
 
-The side panel has two user-facing modes:
+`agent.cancel` takes a `run_id`. The host must continue routing health,
+settings, and tool responses while a run is active. No request may be consumed
+and discarded while waiting for another response.
 
-- `Agent Mode`
-  - full browser MCP tools.
-  - full workspace tools when a workspace exists.
-  - can act, navigate, write files, and edit files when requested.
-- `Chat Mode`
-  - read-only browser and workspace behavior.
-  - can inspect current/attached pages.
-  - can read/search workspace files.
-  - cannot click, type, navigate, create/close tabs, write files, or edit files.
+Implemented behavior:
 
-The mode is passed from the side panel to `agent.run` as `mode: "chat" |
-"agent"`. The native host uses it for:
+- the stdout writer serializes all responses and events,
+- the main input loop remains available while runs execute on worker threads,
+- extension-tool responses are correlated through per-call waiters,
+- cancellation is acknowledged immediately and suppresses late run events,
+- tool failures are returned to the model when recovery is possible,
+- `agent.run` remains as a blocking compatibility entrypoint.
 
-- tool filtering.
-- `tabs` action guarding.
-- workspace tool gating.
-- system prompt mode guidance.
+Remaining v0.2.0 work:
 
-The UI controls mode selection, while the native host enforces tool filtering
-and action limits.
+- stream provider output through `agent.delta`,
+- interrupt an in-flight blocking HTTP request instead of only suppressing its
+  late result,
+- move conversation ownership from the side panel to the native host,
+- split the native host into protocol, provider, agent, and tool modules.
 
-## Response Debug Details
+Native Messaging output is limited to 1 MB per message. Large model output,
+debug traces, page data, and tool results must be chunked or fetched separately
+by identifier.
 
-Assistant messages include a small details button. The message body should show
-only the assistant answer. Diagnostic information belongs in the details panel,
-including:
+## Conversation Context
 
-- system prompt.
-- user message.
-- attached tabs context.
-- messages sent to the model.
-- LLM tool count.
-- MCP tool count.
-- workspace tool count.
-- tool name map.
-- tool definitions.
-- tool results.
+- A conversation has a stable identifier.
+- Prior user and assistant messages are sent in order.
+- Tool calls and tool results stay paired.
+- Context is bounded by message count and serialized size before provider calls.
+- New Chat creates a new context rather than only clearing visible UI.
+- Provider-specific token accounting will replace simple size limits later.
 
-The side panel renders assistant message Markdown directly in the chat body and
-keeps tool-preparation summaries out of the visible answer.
+## Provider Policy
 
-## First Implementation Milestone
+Only providers with a complete request, tool-call, error, and test path may be
+selectable.
 
-Milestone 1 should provide a complete local communication loop:
+Current state:
 
-1. WXT extension builds.
-2. Background configures side panel and native host port.
-3. Side panel can call `agent.health`.
-4. Rust native host responds to `agent.health`, `settings.get`,
-   `settings.set`, `agent.echo`, `agent.run`, `agent.tools`, `llm.tools`,
-   `filesystem.roots`, and `filesystem.list`.
-5. Native host manifest template and Windows install script exist.
-6. Project docs explain installation and verification.
+- OpenAI-compatible Chat Completions: supported.
+- Anthropic Messages API: planned, not yet selectable.
 
-## Risks and Notes
+Provider adapters should eventually share these operations:
 
-- Native host registration requires a stable extension id in `allowed_origins`.
-  During development, set a fixed extension key or update the native host
-  manifest after loading the extension.
-- The native host process lifetime is tied to Chrome's native port. If the port
-  disconnects, Chrome may terminate the host.
-- stdout is protocol-only. Any accidental stdout logging breaks framing.
-- Long model output must stream as small `agent.delta` events.
-- If multiple side-panel views open, the background script should multiplex them
-  over one native port.
+- validate configuration,
+- prepare tool schemas,
+- create a model request,
+- normalize assistant text and tool calls,
+- append tool results,
+- report usage and provider errors.
+
+## Trust and Safety Requirements
+
+- Treat page text, MCP output, and workspace content as untrusted input.
+- Chat Mode must default-deny tools that are not known to be read-only.
+- Agent Mode must require confirmation for sensitive navigation, submission,
+  download, upload, credential, and filesystem mutation actions.
+- Tool errors should be returned to the model as tool errors when recovery is
+  possible; one failed tool should not automatically destroy the whole run.
+- API keys must not appear in logs, debug payloads, or model prompts.
+- Debug details should be fetched by run id instead of duplicating all data in
+  every assistant response.
+
+## Target Native-host Modules
+
+The current single-file host should be split along ownership boundaries:
+
+```text
+src/
+  main.rs
+  protocol.rs
+  settings.rs
+  providers/
+    mod.rs
+    openai.rs
+    anthropic.rs
+  agent/
+    mod.rs
+    run.rs
+    policy.rs
+  tools/
+    mod.rs
+    mcp.rs
+    extension.rs
+    workspace.rs
+```
+
+The split should happen while implementing the asynchronous run protocol, not
+as an unrelated rewrite.
+
+## Verification Strategy
+
+Every release must pass:
+
+```powershell
+cd extension
+npm run typecheck
+npm run build
+
+cd ..\native-host
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+When a DeepSeek test key is available, run the real-provider E2E without
+persisting credentials in the repository:
+
+```powershell
+$env:DEEPSEEK_API_KEY = "<temporary-api-key>"
+python ..\scripts\test_deepseek_e2e.py --model deepseek-v4-flash
+Remove-Item Env:DEEPSEEK_API_KEY
+```
+
+The v0.2.0 gate also requires automated coverage for:
+
+- settings round trips and save failures,
+- multi-turn context ordering and limits,
+- cancellation and concurrent request routing,
+- extension-tool request correlation,
+- Chat Mode mutation denial,
+- workspace traversal and symlink rejection,
+- MCP initialization, tool discovery, and tool errors,
+- a Chrome extension smoke test using a test page.

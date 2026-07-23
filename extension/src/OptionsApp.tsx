@@ -18,7 +18,6 @@ type SaveState =
   | { kind: 'error'; text: string }
 
 export function OptionsApp() {
-  const [settings, setSettings] = useState<SettingsResult>(DEFAULT_SETTINGS)
   const [draftSettings, setDraftSettings] = useState<SettingsResult>(DEFAULT_SETTINGS)
   const [status, setStatus] = useState<SaveState>({
     kind: 'idle',
@@ -40,12 +39,18 @@ export function OptionsApp() {
     try {
       const health = await callNative<HealthResult>('agent.health')
       const syncedSettings = normalizeSettings(await callNative<SettingsResult>('settings.get'))
-      setSettings(syncedSettings)
       setDraftSettings(syncedSettings)
-      setStatus({
-        kind: 'success',
-        text: `Configuration loaded. Native host ready: ${health.service} ${health.version}`,
-      })
+      setStatus(
+        syncedSettings.model_api_type === 'anthropic'
+          ? {
+              kind: 'error',
+              text: 'Anthropic API is not supported yet. Select OpenAI API before saving.',
+            }
+          : {
+              kind: 'success',
+              text: `Configuration loaded. Native host ready: ${health.service} ${health.version}`,
+            },
+      )
     } catch (error) {
       setStatus({
         kind: 'error',
@@ -60,7 +65,6 @@ export function OptionsApp() {
     setStatus({ kind: 'checking', text: 'Saving configuration...' })
     try {
       const nextSettings = normalizeSettings(await callNative<SettingsResult>('settings.set', draftSettings))
-      setSettings(nextSettings)
       setDraftSettings(nextSettings)
       await chrome.runtime
         .sendMessage({ type: 'settings.changed', settings: nextSettings })
@@ -87,6 +91,7 @@ export function OptionsApp() {
   }
 
   const saving = status.kind === 'checking'
+  const providerUnavailable = draftSettings.model_api_type !== 'openai'
   const modelBaseUrlPlaceholder =
     draftSettings.model_api_type === 'anthropic'
       ? 'https://api.anthropic.com'
@@ -170,7 +175,9 @@ export function OptionsApp() {
             onChange={(event) => updateDraft('model_api_type', event.target.value as ModelApiType)}
           >
             <option value="openai">OpenAI API</option>
-            <option value="anthropic">Anthropic API</option>
+            <option value="anthropic" disabled>
+              Anthropic API (planned)
+            </option>
           </select>
 
           <label htmlFor="model-base-url">Base URL</label>
@@ -250,7 +257,11 @@ export function OptionsApp() {
           </div>
 
           <div className="settings-actions">
-            <button className="configure-button" type="submit" disabled={saving}>
+            <button
+              className="configure-button"
+              type="submit"
+              disabled={saving || providerUnavailable}
+            >
               <Save size={15} />
               Save
             </button>

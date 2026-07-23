@@ -12,6 +12,7 @@ import {
   Globe,
   Info,
   Layers,
+  LoaderCircle,
   MessageSquare,
   MousePointer2,
   RefreshCw,
@@ -30,7 +31,8 @@ import {
   normalizeSettings,
 } from './settings'
 import type {
-  AgentRunResult,
+  AgentEventPayload,
+  AgentStartResult,
   BackgroundRequest,
   ChatMessage,
   FileSystemEntry,
@@ -130,7 +132,7 @@ export function App() {
   const [settings, setSettings] = useState<SettingsResult>(DEFAULT_SETTINGS)
   const [recentWorkspaces, setRecentWorkspaces] = useState<WorkspaceFolder[]>([])
   const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [mode, setMode] = useState<ChatMode>('agent')
+  const [mode, setMode] = useState<ChatMode>('chat')
   const [attachedTabs, setAttachedTabs] = useState<chrome.tabs.Tab[]>([])
   const [availableTabs, setAvailableTabs] = useState<chrome.tabs.Tab[]>([])
   const [tabPickerOpen, setTabPickerOpen] = useState(false)
@@ -145,11 +147,15 @@ export function App() {
   const [workspaceBrowserError, setWorkspaceBrowserError] = useState<string | null>(null)
   const [prompt, setPrompt] = useState('')
   const [busy, setBusy] = useState(false)
+  const [activeRunId, setActiveRunId] = useState<string | null>(null)
   const messagesRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const pickerLayerRef = useRef<HTMLDivElement>(null)
   const tabPickerButtonRef = useRef<HTMLButtonElement>(null)
   const workspacePickerButtonRef = useRef<HTMLButtonElement>(null)
+  const activeRunIdRef = useRef<string | null>(null)
+  const startingRunRef = useRef(false)
+  const finishedBeforeStartResponseRef = useRef(new Set<string>())
 
   const configured = isSettingsConfigured(settings)
   const canSend = prompt.trim().length > 0 && !busy && configured
@@ -178,12 +184,86 @@ export function App() {
     function handleRuntimeMessage(message: BackgroundRequest) {
       if (message?.type === 'settings.changed') {
         setSettings(normalizeSettings(message.settings))
+        return
+      }
+      if (message?.type !== 'native.event') return
+
+      const event = message.event
+      const payload = event.payload as AgentEventPayload | undefined
+      if (!payload?.run_id) return
+      const currentRunId = activeRunIdRef.current
+      if (payload.run_id !== currentRunId && !(startingRunRef.current && !currentRunId)) {
+        return
+      }
+      if (!currentRunId) {
+        activeRunIdRef.current = payload.run_id
+        setActiveRunId(payload.run_id)
+      }
+
+      if (event.event === 'agent.status') {
+        const text = payload.state === 'model' ? 'Waiting for model...' : 'Agent is working...'
+        setHealth({ kind: 'checking', text })
+        return
+      }
+      if (event.event === 'agent.tool.started') {
+        setHealth({ kind: 'checking', text: `Using ${payload.tool_name || 'tool'}...` })
+        return
+      }
+      if (event.event === 'agent.tool.finished') {
+        setHealth({
+          kind: payload.ok === false ? 'error' : 'checking',
+          text:
+            payload.ok === false
+              ? `${payload.tool_name || 'Tool'} failed; attempting recovery...`
+              : `Finished ${payload.tool_name || 'tool'}`,
+        })
+        return
+      }
+      if (event.event === 'agent.done' && payload.result) {
+        setMessages((current) => [
+          ...current,
+          {
+            id: createId(),
+            role: 'assistant',
+            content: payload.result?.message || 'Completed.',
+            time: nowLabel(),
+            debug: payload.result?.debug,
+          },
+        ])
+        setAttachedTabs([])
+        setHealth({ kind: 'online', text: 'Completed' })
+        finishActiveRun(payload.run_id)
+        return
+      }
+      if (event.event === 'agent.error') {
+        const text = payload.error?.message || 'Agent run failed'
+        setMessages((current) => [
+          ...current,
+          { id: createId(), role: 'error', content: text, time: nowLabel() },
+        ])
+        setHealth({ kind: 'error', text })
+        finishActiveRun(payload.run_id)
+        return
+      }
+      if (event.event === 'agent.cancelled') {
+        setHealth({ kind: 'idle', text: 'Cancelled' })
+        finishActiveRun(payload.run_id)
       }
     }
 
     chrome.runtime.onMessage.addListener(handleRuntimeMessage)
     return () => chrome.runtime.onMessage.removeListener(handleRuntimeMessage)
   }, [])
+
+  function finishActiveRun(runId?: string) {
+    if (runId && startingRunRef.current) {
+      finishedBeforeStartResponseRef.current.add(runId)
+    }
+    activeRunIdRef.current = null
+    startingRunRef.current = false
+    setActiveRunId(null)
+    setBusy(false)
+  }
 
   useEffect(() => {
     messagesRef.current?.scrollTo({
@@ -246,12 +326,32 @@ export function App() {
   }
 
   async function startNewChat() {
+    const runId = activeRunIdRef.current
+    activeRunIdRef.current = null
+    startingRunRef.current = false
+    setActiveRunId(null)
+    setBusy(false)
+    if (runId) {
+      await callNative('agent.cancel', { run_id: runId }).catch(() => undefined)
+    }
     setMessages([])
     setPrompt('')
     setAttachedTabs([])
     setHealth({ kind: 'idle', text: 'Chat reset' })
     await callNative('agent.reset').catch(() => undefined)
     inputRef.current?.focus()
+  }
+
+  async function cancelActiveRun() {
+    const runId = activeRunIdRef.current
+    if (!runId) return
+    setHealth({ kind: 'checking', text: 'Cancelling...' })
+    try {
+      await callNative('agent.cancel', { run_id: runId })
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      setHealth({ kind: 'error', text: `Cancel failed: ${text}` })
+    }
   }
 
   async function attachActiveTab() {
@@ -398,9 +498,13 @@ export function App() {
   async function submitPrompt() {
     const raw = prompt.trim()
     if (!raw || busy) return
+    const history = messages
+      .filter((message) => message.role === 'user' || message.role === 'assistant')
+      .map((message) => ({ role: message.role, content: message.content }))
 
     setPrompt('')
     setBusy(true)
+    startingRunRef.current = true
     setHealth({ kind: 'checking', text: 'Agent is working...' })
     setMessages((current) => [
       ...current,
@@ -413,8 +517,9 @@ export function App() {
     ])
 
     try {
-      const result = await callNative<AgentRunResult>('agent.run', {
+      const started = await callNative<AgentStartResult>('agent.start', {
         message: raw,
+        history,
         mode,
         attached_tabs: attachedTabs.map((tab) => ({
           tabId: tab.id,
@@ -422,18 +527,11 @@ export function App() {
           url: tab.url,
         })),
       })
-      setMessages((current) => [
-        ...current,
-        {
-          id: createId(),
-          role: 'assistant',
-          content: result.message,
-          time: nowLabel(),
-          debug: result.debug,
-        },
-      ])
-      setAttachedTabs([])
-      setHealth({ kind: 'online', text: 'Completed' })
+      if (finishedBeforeStartResponseRef.current.delete(started.run_id)) return
+      activeRunIdRef.current = started.run_id
+      startingRunRef.current = false
+      setActiveRunId(started.run_id)
+      setHealth({ kind: 'checking', text: 'Agent is working...' })
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error)
       setMessages((current) => [
@@ -446,8 +544,7 @@ export function App() {
         },
       ])
       setHealth({ kind: 'error', text })
-    } finally {
-      setBusy(false)
+      finishActiveRun()
     }
   }
 
@@ -459,10 +556,13 @@ export function App() {
   return (
     <main className={`app-shell ${configured ? 'configured' : 'needs-config'}`}>
       <header className="chat-header">
-        <button className="provider-button" type="button" title="Assistant provider">
-          <Bot size={18} />
-          <span>Brosdk</span>
-        </button>
+        <div className="header-identity">
+          <button className="provider-button" type="button" title="Assistant provider">
+            <Bot size={18} />
+            <span>Brosdk</span>
+          </button>
+          <ModeStatusChip mode={mode} settings={settings} />
+        </div>
         <div className="header-actions">
           <button
             className="icon-button"
@@ -605,8 +705,18 @@ export function App() {
             disabled={busy || !configured}
             rows={1}
           />
-          <button className="send-button" type={busy ? 'button' : 'submit'} disabled={!canSend && !busy}>
-            {busy ? <Square size={15} /> : <Send size={15} />}
+          <button
+            className="send-button"
+            type={busy ? 'button' : 'submit'}
+            disabled={busy ? !activeRunId : !canSend}
+            title={busy ? 'Stop run' : 'Send'}
+            onClick={busy ? () => void cancelActiveRun() : undefined}
+          >
+            {busy ? (
+              activeRunId ? <Square size={14} /> : <LoaderCircle className="working-spinner" size={15} />
+            ) : (
+              <Send size={15} />
+            )}
           </button>
         </form>
       </footer>
@@ -921,6 +1031,30 @@ function AttachedTabs({
         ))}
       </div>
     </div>
+  )
+}
+
+function ModeStatusChip({ mode, settings }: { mode: ChatMode; settings: SettingsResult }) {
+  const browserMode = settings.browser_tools_mode
+  const sourceLabel =
+    browserMode === 'extension' ? 'EXT' : browserMode === 'off' ? 'OFF' : 'MCP'
+  const modeLabel = mode === 'agent' ? 'Agent' : 'Chat'
+  const sourceTitle =
+    browserMode === 'extension'
+      ? 'Chrome Extension browser tools'
+      : browserMode === 'off'
+        ? 'Browser tools disabled'
+        : 'MCP browser tools'
+
+  return (
+    <span
+      className={`mode-status-chip source-${browserMode}`}
+      title={`${modeLabel} mode · ${sourceTitle}`}
+    >
+      <span className="mode-status-dot" aria-hidden="true" />
+      <span>{modeLabel}</span>
+      <strong>{sourceLabel}</strong>
+    </span>
   )
 }
 

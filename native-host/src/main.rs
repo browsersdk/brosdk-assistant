@@ -9,6 +9,11 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const SERVICE_NAME: &str = "brosdk-assistant-native";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -16,6 +21,12 @@ const MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const OPENAI_TOOL_NAME_MAX_LENGTH: usize = 64;
 const MAX_OPENAI_TOOL_ROUNDS: usize = 6;
+const MAX_HISTORY_MESSAGES: usize = 24;
+const MAX_HISTORY_BYTES: usize = 64 * 1024;
+const MAX_USER_MESSAGE_BYTES: usize = 64 * 1024;
+const EXTENSION_TOOL_TIMEOUT: Duration = Duration::from_secs(90);
+static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_EXTENSION_TOOL_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -65,11 +76,85 @@ struct McpHttpClient {
     session_id: Option<String>,
 }
 
+type RunRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+
+#[derive(Clone)]
+struct HostBridge {
+    outbound: Sender<Value>,
+    extension_waiters: Arc<Mutex<HashMap<String, Sender<Value>>>>,
+}
+
+impl HostBridge {
+    fn send(&self, value: Value) -> Result<(), String> {
+        self.outbound
+            .send(value)
+            .map_err(|_| "native output channel is closed".to_string())
+    }
+
+    fn send_response(&self, response: Response) -> Result<(), String> {
+        let value = serde_json::to_value(response)
+            .map_err(|error| format!("failed to encode response: {error}"))?;
+        self.send(value)
+    }
+
+    fn send_event(&self, event: &str, payload: Value) -> Result<(), String> {
+        self.send(json!({ "event": event, "payload": payload }))
+    }
+
+    fn route_extension_response(&self, message: &Value) -> bool {
+        let Some(id) = message.get("id").and_then(Value::as_str) else {
+            return false;
+        };
+        let waiter = self
+            .extension_waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(id));
+        if let Some(waiter) = waiter {
+            let _ = waiter.send(message.clone());
+            return true;
+        }
+        false
+    }
+}
+
+#[derive(Clone)]
+struct RunContext {
+    run_id: String,
+    cancelled: Arc<AtomicBool>,
+    bridge: HostBridge,
+}
+
+impl RunContext {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    fn ensure_active(&self) -> Result<(), String> {
+        if self.is_cancelled() {
+            Err("run cancelled".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn emit(&self, event: &str, mut payload: Value) {
+        if !self.is_cancelled() {
+            if let Value::Object(fields) = &mut payload {
+                fields.insert("run_id".to_string(), json!(self.run_id));
+            } else {
+                payload = json!({ "run_id": self.run_id, "data": payload });
+            }
+            let _ = self.bridge.send_event(event, payload);
+        }
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
             workspace_dir: ".".to_string(),
-            browser_tools_mode: "mcp".to_string(),
+            browser_tools_mode: "extension".to_string(),
             open_side_panel_on_action_click: true,
             side_panel_per_window: true,
             mcp_url: "http://127.0.0.1:3000/mcp".to_string(),
@@ -84,6 +169,20 @@ impl Default for Settings {
 
 fn main() {
     let (mut settings, mut settings_configured) = load_settings();
+    let (outbound, output) = mpsc::channel::<Value>();
+    thread::spawn(move || {
+        for value in output {
+            if let Err(error) = write_message(&value) {
+                eprintln!("[native] write failed: {error}");
+                break;
+            }
+        }
+    });
+    let bridge = HostBridge {
+        outbound,
+        extension_waiters: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let runs: RunRegistry = Arc::new(Mutex::new(HashMap::new()));
     let ready = json!({
         "event": "native.ready",
         "payload": {
@@ -92,7 +191,7 @@ fn main() {
             "pid": process::id()
         }
     });
-    if let Err(error) = write_message(&ready) {
+    if let Err(error) = bridge.send(ready) {
         eprintln!("[native] failed to send ready event: {error}");
         return;
     }
@@ -107,6 +206,10 @@ fn main() {
             }
         };
 
+        if bridge.route_extension_response(&message) {
+            continue;
+        }
+
         let request: Request = match serde_json::from_value(message) {
             Ok(request) => request,
             Err(error) => {
@@ -115,11 +218,136 @@ fn main() {
             }
         };
 
-        let response = handle_request(request, &mut settings, &mut settings_configured);
-        if let Err(error) = write_response(&response) {
-            eprintln!("[native] write failed: {error}");
-            break;
+        match request.method.as_str() {
+            "agent.start" => {
+                start_agent_run(request, &settings, &bridge, &runs);
+            }
+            "agent.cancel" => {
+                cancel_agent_run(request, &bridge, &runs);
+            }
+            "agent.reset" => {
+                reset_agent_runs(request, &bridge, &runs);
+            }
+            _ => {
+                let response =
+                    handle_request(request, &mut settings, &mut settings_configured, &bridge);
+                if let Err(error) = bridge.send_response(response) {
+                    eprintln!("[native] failed to queue response: {error}");
+                    break;
+                }
+            }
         }
+    }
+}
+
+fn start_agent_run(request: Request, settings: &Settings, bridge: &HostBridge, runs: &RunRegistry) {
+    let run_id = format!(
+        "run-{}-{}",
+        process::id(),
+        NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let effective_settings =
+        settings_from_params(&request.params).unwrap_or_else(|| settings.clone());
+    let params = request.params;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    if let Ok(mut active_runs) = runs.lock() {
+        active_runs.insert(run_id.clone(), cancelled.clone());
+    } else {
+        let _ = bridge.send_response(err(
+            request.id,
+            "run_registry_failed",
+            "failed to access agent run registry",
+        ));
+        return;
+    }
+
+    if let Err(error) = bridge.send_response(ok(
+        request.id,
+        json!({ "run_id": run_id, "state": "queued" }),
+    )) {
+        eprintln!("[native] failed to queue agent.start response: {error}");
+        if let Ok(mut active_runs) = runs.lock() {
+            active_runs.remove(&run_id);
+        }
+        return;
+    }
+
+    let context = RunContext {
+        run_id: run_id.clone(),
+        cancelled,
+        bridge: bridge.clone(),
+    };
+    let active_runs = runs.clone();
+    thread::spawn(move || {
+        if !context.is_cancelled() {
+            context.emit("agent.status", json!({ "state": "running" }));
+        }
+        let result = run_agent(
+            &params,
+            &effective_settings,
+            Some(&context),
+            &context.bridge,
+        );
+        if !context.is_cancelled() {
+            match result {
+                Ok(result) => context.emit("agent.done", json!({ "result": result })),
+                Err(error) => context.emit(
+                    "agent.error",
+                    json!({
+                        "error": {
+                            "code": "agent_run_failed",
+                            "message": error,
+                        }
+                    }),
+                ),
+            }
+        }
+        if let Ok(mut runs) = active_runs.lock() {
+            runs.remove(&run_id);
+        }
+    });
+}
+
+fn cancel_agent_run(request: Request, bridge: &HostBridge, runs: &RunRegistry) {
+    let Some(run_id) = request.params.get("run_id").and_then(Value::as_str) else {
+        let _ = bridge.send_response(err(request.id, "invalid_params", "run_id is required"));
+        return;
+    };
+    let cancelled = runs
+        .lock()
+        .ok()
+        .and_then(|active_runs| active_runs.get(run_id).cloned());
+    let Some(cancelled) = cancelled else {
+        let _ = bridge.send_response(err(request.id, "run_not_found", "agent run was not found"));
+        return;
+    };
+    cancelled.store(true, Ordering::SeqCst);
+    let _ = bridge.send_response(ok(
+        request.id,
+        json!({ "run_id": run_id, "state": "cancelled" }),
+    ));
+    let _ = bridge.send_event("agent.cancelled", json!({ "run_id": run_id }));
+}
+
+fn reset_agent_runs(request: Request, bridge: &HostBridge, runs: &RunRegistry) {
+    let run_ids = runs
+        .lock()
+        .map(|active_runs| {
+            active_runs
+                .iter()
+                .map(|(run_id, cancelled)| {
+                    cancelled.store(true, Ordering::SeqCst);
+                    run_id.clone()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let _ = bridge.send_response(ok(
+        request.id,
+        json!({ "ok": true, "cancelled_runs": run_ids.len() }),
+    ));
+    for run_id in run_ids {
+        let _ = bridge.send_event("agent.cancelled", json!({ "run_id": run_id }));
     }
 }
 
@@ -127,6 +355,7 @@ fn handle_request(
     request: Request,
     settings: &mut Settings,
     settings_configured: &mut bool,
+    bridge: &HostBridge,
 ) -> Response {
     match request.method.as_str() {
         "agent.health" => ok(
@@ -141,68 +370,40 @@ fn handle_request(
         "agent.echo" => ok(request.id, json!({ "echo": request.params })),
         "settings.get" => ok(request.id, settings_json(settings, *settings_configured)),
         "settings.set" => {
-            if let Some(workspace_dir) = request.params.get("workspace_dir").and_then(Value::as_str)
-            {
-                settings.workspace_dir = workspace_dir.to_string();
+            let next = match settings_with_updates(settings, &request.params) {
+                Ok(next) => next,
+                Err(error) => return err(request.id, "invalid_settings", &error),
+            };
+            match save_settings(&next) {
+                Ok(()) => {
+                    *settings = next;
+                    *settings_configured = is_settings_configured(settings);
+                    ok(request.id, settings_json(settings, *settings_configured))
+                }
+                Err(error) => err(
+                    request.id,
+                    "settings_save_failed",
+                    &format!("failed to save settings: {error}"),
+                ),
             }
-            if let Some(mcp_url) = request.params.get("mcp_url").and_then(Value::as_str) {
-                settings.mcp_url = mcp_url.to_string();
-            }
-            if let Some(browser_tools_mode) = request
-                .params
-                .get("browser_tools_mode")
-                .and_then(Value::as_str)
-            {
-                settings.browser_tools_mode = normalize_browser_tools_mode(browser_tools_mode);
-            }
-            if let Some(open_side_panel_on_action_click) = request
-                .params
-                .get("open_side_panel_on_action_click")
-                .and_then(Value::as_bool)
-            {
-                settings.open_side_panel_on_action_click = open_side_panel_on_action_click;
-            }
-            if let Some(side_panel_per_window) = request
-                .params
-                .get("side_panel_per_window")
-                .and_then(Value::as_bool)
-            {
-                settings.side_panel_per_window = side_panel_per_window;
-            }
-            if let Some(model_base_url) =
-                request.params.get("model_base_url").and_then(Value::as_str)
-            {
-                settings.model_base_url = model_base_url.to_string();
-            }
-            if let Some(model_name) = request.params.get("model_name").and_then(Value::as_str) {
-                settings.model_name = model_name.to_string();
-            }
-            if let Some(model_api_type) =
-                request.params.get("model_api_type").and_then(Value::as_str)
-            {
-                settings.model_api_type = model_api_type.to_string();
-            }
-            if let Some(api_key) = request.params.get("api_key").and_then(Value::as_str) {
-                settings.api_key = api_key.to_string();
-            }
-            if let Some(temperature) = request.params.get("temperature").and_then(Value::as_f64) {
-                settings.temperature = temperature;
-            }
-            match save_settings(settings) {
-                Ok(()) => *settings_configured = is_settings_configured(settings),
-                Err(error) => eprintln!("[native] failed to save settings: {error}"),
-            }
-            ok(request.id, settings_json(settings, *settings_configured))
         }
         "workspace.set" => {
             if let Some(workspace_dir) = request.params.get("workspace_dir").and_then(Value::as_str)
             {
-                settings.workspace_dir = workspace_dir.to_string();
-                match save_settings(settings) {
-                    Ok(()) => *settings_configured = is_settings_configured(settings),
-                    Err(error) => eprintln!("[native] failed to save settings: {error}"),
+                let mut next = settings.clone();
+                next.workspace_dir = workspace_dir.to_string();
+                match save_settings(&next) {
+                    Ok(()) => {
+                        *settings = next;
+                        *settings_configured = is_settings_configured(settings);
+                        ok(request.id, settings_json(settings, *settings_configured))
+                    }
+                    Err(error) => err(
+                        request.id,
+                        "settings_save_failed",
+                        &format!("failed to save workspace setting: {error}"),
+                    ),
                 }
-                ok(request.id, settings_json(settings, *settings_configured))
             } else {
                 err(request.id, "invalid_params", "workspace_dir is required")
             }
@@ -221,7 +422,7 @@ fn handle_request(
         "agent.run" => {
             let effective_settings =
                 settings_from_params(&request.params).unwrap_or_else(|| settings.clone());
-            match run_agent(&request.params, &effective_settings) {
+            match run_agent(&request.params, &effective_settings, None, bridge) {
                 Ok(result) => ok(request.id, result),
                 Err(error) => err(request.id, "agent_run_failed", &error),
             }
@@ -246,7 +447,6 @@ fn handle_request(
                 Err(error) => err(request.id, "mcp_tools_failed", &error),
             }
         }
-        "agent.cancel" | "agent.reset" => ok(request.id, json!({ "ok": true })),
         "tabs.list" => ok(request.id, json!({ "tabs": [] })),
         "tabs.active" => ok(request.id, json!({ "active_tab": null })),
         _ => err(request.id, "unknown_method", "Unknown method"),
@@ -265,90 +465,137 @@ fn settings_from_params(params: &Value) -> Option<Settings> {
         })
 }
 
-fn run_agent(params: &Value, settings: &Settings) -> Result<Value, String> {
+fn settings_with_updates(current: &Settings, params: &Value) -> Result<Settings, String> {
+    if !params.is_object() {
+        return Err("settings must be a JSON object".to_string());
+    }
+
+    let mut next = current.clone();
+    if let Some(value) = params.get("workspace_dir").and_then(Value::as_str) {
+        next.workspace_dir = value.to_string();
+    }
+    if let Some(value) = params.get("mcp_url").and_then(Value::as_str) {
+        next.mcp_url = value.to_string();
+    }
+    if let Some(value) = params.get("browser_tools_mode").and_then(Value::as_str) {
+        if !matches!(value, "mcp" | "extension" | "off") {
+            return Err(format!("unsupported browser tools mode: {value}"));
+        }
+        next.browser_tools_mode = value.to_string();
+    }
+    if let Some(value) = params
+        .get("open_side_panel_on_action_click")
+        .and_then(Value::as_bool)
+    {
+        next.open_side_panel_on_action_click = value;
+    }
+    if let Some(value) = params.get("side_panel_per_window").and_then(Value::as_bool) {
+        next.side_panel_per_window = value;
+    }
+    if let Some(value) = params.get("model_base_url").and_then(Value::as_str) {
+        next.model_base_url = value.to_string();
+    }
+    if let Some(value) = params.get("model_name").and_then(Value::as_str) {
+        next.model_name = value.to_string();
+    }
+    if let Some(value) = params.get("model_api_type").and_then(Value::as_str) {
+        if value != "openai" {
+            return Err(format!("unsupported model API type: {value}"));
+        }
+        next.model_api_type = value.to_string();
+    }
+    if let Some(value) = params.get("api_key").and_then(Value::as_str) {
+        next.api_key = value.to_string();
+    }
+    if let Some(value) = params.get("temperature").and_then(Value::as_f64) {
+        if !(0.0..=2.0).contains(&value) {
+            return Err("temperature must be between 0 and 2".to_string());
+        }
+        next.temperature = value;
+    }
+    Ok(next)
+}
+
+struct AgentInput<'a> {
+    message: &'a str,
+    prompt: &'a str,
+    attached_tabs_context: Option<&'a str>,
+    history: &'a [Value],
+}
+
+fn run_agent(
+    params: &Value,
+    settings: &Settings,
+    run_context: Option<&RunContext>,
+    bridge: &HostBridge,
+) -> Result<Value, String> {
+    ensure_run_active(run_context)?;
     let message = params
         .get("message")
         .and_then(Value::as_str)
         .ok_or_else(|| "message is required".to_string())?;
+    if message.len() > MAX_USER_MESSAGE_BYTES {
+        return Err(format!(
+            "message is too large; maximum size is {MAX_USER_MESSAGE_BYTES} bytes"
+        ));
+    }
     let chat_mode = request_is_chat_mode(params);
+    let history = conversation_history(params);
     let prepared = prepare_llm_tools(settings, chat_mode)?;
+    ensure_run_active(run_context)?;
     let attached_tabs_context = attached_tabs_context(params);
     let prompt = system_prompt(
         attached_tabs_context.as_deref(),
         prepared.workspace_root.as_deref(),
         chat_mode,
     );
-    let debug_messages = initial_agent_messages(&prompt, message);
-
     if settings.model_api_type != "openai" {
-        let debug = agent_debug_info(
-            &prompt,
-            message,
-            attached_tabs_context.as_deref(),
-            &debug_messages,
-            &[],
-            &prepared,
-        );
-        return Ok(json!({
-            "accepted": true,
-            "message": "Anthropic API execution is not wired yet; tools were prepared.",
-            "llm_tool_count": prepared.llm_tools.len(),
-            "mcp_tool_count": prepared.mcp_tools.len(),
-            "extension_tool_count": prepared.extension_tools.len(),
-            "workspace_tool_count": prepared.workspace_tools.len(),
-            "tools": &prepared.llm_tools,
-            "tool_name_map": &prepared.tool_name_map,
-            "debug": debug,
-        }));
+        return Err(format!(
+            "model API type '{}' is not supported yet",
+            settings.model_api_type
+        ));
     }
 
     if settings.model_base_url.trim().is_empty()
         || settings.model_name.trim().is_empty()
         || settings.api_key.trim().is_empty()
     {
-        let debug = agent_debug_info(
-            &prompt,
-            message,
-            attached_tabs_context.as_deref(),
-            &debug_messages,
-            &[],
-            &prepared,
-        );
-        return Ok(json!({
-            "accepted": true,
-            "message": "Model configuration is incomplete; tools were prepared.",
-            "llm_tool_count": prepared.llm_tools.len(),
-            "mcp_tool_count": prepared.mcp_tools.len(),
-            "extension_tool_count": prepared.extension_tools.len(),
-            "workspace_tool_count": prepared.workspace_tools.len(),
-            "tools": &prepared.llm_tools,
-            "tool_name_map": &prepared.tool_name_map,
-            "debug": debug,
-        }));
+        return Err("model configuration is incomplete".to_string());
     }
 
     run_openai_agent(
-        message,
-        &prompt,
-        attached_tabs_context.as_deref(),
+        AgentInput {
+            message,
+            prompt: &prompt,
+            attached_tabs_context: attached_tabs_context.as_deref(),
+            history: &history,
+        },
         settings,
         prepared,
+        run_context,
+        bridge,
     )
 }
 
 fn run_openai_agent(
-    message: &str,
-    prompt: &str,
-    attached_tabs_context: Option<&str>,
+    input: AgentInput<'_>,
     settings: &Settings,
     prepared: PreparedTools,
+    run_context: Option<&RunContext>,
+    bridge: &HostBridge,
 ) -> Result<Value, String> {
+    let AgentInput {
+        message,
+        prompt,
+        attached_tabs_context,
+        history,
+    } = input;
     let http = Client::builder()
         .timeout(std::time::Duration::from_secs(180))
         .build()
         .map_err(|error| format!("failed to create model HTTP client: {error}"))?;
     let endpoint = openai_chat_completions_url(&settings.model_base_url)?;
-    let mut messages = initial_agent_messages(prompt, message);
+    let mut messages = initial_agent_messages(prompt, history, message);
 
     let browser_tools_mode = normalize_browser_tools_mode(&settings.browser_tools_mode);
     let mut mcp = if browser_tools_mode == "mcp" {
@@ -361,8 +608,13 @@ fn run_openai_agent(
     let mut tool_results = Vec::new();
 
     for _round in 0..MAX_OPENAI_TOOL_ROUNDS {
+        ensure_run_active(run_context)?;
+        if let Some(context) = run_context {
+            context.emit("agent.status", json!({ "state": "model" }));
+        }
         let response =
             call_openai_chat(&http, &endpoint, settings, &messages, &prepared.llm_tools)?;
+        ensure_run_active(run_context)?;
         let assistant_message = response
             .get("choices")
             .and_then(Value::as_array)
@@ -431,21 +683,67 @@ fn run_openai_agent(
                 .unwrap_or("{}");
             let arguments = serde_json::from_str::<Value>(arguments_text)
                 .map_err(|error| format!("invalid tool arguments for {safe_name}: {error}"))?;
-            let output = if is_workspace_tool(original_name) {
-                let root = prepared.workspace_root.as_deref().ok_or_else(|| {
-                    "workspace tool requested without a selected workspace".to_string()
-                })?;
-                call_workspace_tool(root, original_name, arguments)?
+            if let Some(context) = run_context {
+                context.emit(
+                    "agent.tool.started",
+                    json!({ "tool_call_id": call_id, "tool_name": original_name }),
+                );
+            }
+            let execution = if is_workspace_tool(original_name) {
+                prepared
+                    .workspace_root
+                    .as_deref()
+                    .ok_or_else(|| {
+                        "workspace tool requested without a selected workspace".to_string()
+                    })
+                    .and_then(|root| call_workspace_tool(root, original_name, arguments))
             } else if is_extension_browser_tool(original_name) {
-                call_extension_browser_tool(original_name, arguments)?
+                call_extension_browser_tool(bridge, run_context, original_name, arguments)
             } else {
                 if prepared.chat_mode {
                     guard_chat_mode_mcp_tool(original_name, &arguments)?;
                 }
-                let mcp = mcp.as_mut().ok_or_else(|| {
-                    format!("MCP tool requested while MCP mode is disabled: {original_name}")
-                })?;
-                mcp.call_tool(original_name, arguments)?
+                mcp.as_mut()
+                    .ok_or_else(|| {
+                        format!("MCP tool requested while MCP mode is disabled: {original_name}")
+                    })
+                    .and_then(|mcp| mcp.call_tool(original_name, arguments))
+            };
+            ensure_run_active(run_context)?;
+            let (output, is_error) = match execution {
+                Ok(output) => {
+                    if let Some(context) = run_context {
+                        context.emit(
+                            "agent.tool.finished",
+                            json!({
+                                "tool_call_id": call_id,
+                                "tool_name": original_name,
+                                "ok": true,
+                            }),
+                        );
+                    }
+                    (output, false)
+                }
+                Err(error) => {
+                    if let Some(context) = run_context {
+                        context.emit(
+                            "agent.tool.finished",
+                            json!({
+                                "tool_call_id": call_id,
+                                "tool_name": original_name,
+                                "ok": false,
+                                "error": error,
+                            }),
+                        );
+                    }
+                    (
+                        json!({
+                            "content": [{ "type": "text", "text": error }],
+                            "isError": true,
+                        }),
+                        true,
+                    )
+                }
             };
             let output_text = serde_json::to_string(&output)
                 .map_err(|error| format!("failed to encode tool output: {error}"))?;
@@ -457,6 +755,7 @@ fn run_openai_agent(
             tool_results.push(json!({
                 "tool_call_id": call_id,
                 "tool_name": original_name,
+                "is_error": is_error,
                 "output": output,
             }));
         }
@@ -486,17 +785,69 @@ fn run_openai_agent(
     }))
 }
 
-fn initial_agent_messages(prompt: &str, message: &str) -> Vec<Value> {
-    vec![
-        json!({
-            "role": "system",
-            "content": prompt
-        }),
-        json!({
-            "role": "user",
-            "content": message
-        }),
-    ]
+fn ensure_run_active(run_context: Option<&RunContext>) -> Result<(), String> {
+    if let Some(context) = run_context {
+        context.ensure_active()?;
+    }
+    Ok(())
+}
+
+fn initial_agent_messages(prompt: &str, history: &[Value], message: &str) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(json!({
+        "role": "system",
+        "content": prompt
+    }));
+    messages.extend(history.iter().cloned());
+    messages.push(json!({
+        "role": "user",
+        "content": message
+    }));
+    messages
+}
+
+fn conversation_history(params: &Value) -> Vec<Value> {
+    let Some(items) = params.get("history").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut history = Vec::new();
+    let mut pending_user = None;
+    for item in items {
+        let Some(role) = item.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(content) = item.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if content.trim().is_empty() || content.len() > MAX_HISTORY_BYTES {
+            continue;
+        }
+        match role {
+            "user" => pending_user = Some(json!({ "role": role, "content": content })),
+            "assistant" => {
+                if let Some(user) = pending_user.take() {
+                    history.push(user);
+                    history.push(json!({ "role": role, "content": content }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if history.len() > MAX_HISTORY_MESSAGES {
+        history.drain(..history.len() - MAX_HISTORY_MESSAGES);
+    }
+    while serialized_size(&history) > MAX_HISTORY_BYTES && history.len() >= 2 {
+        history.drain(..2);
+    }
+    history
+}
+
+fn serialized_size(value: &impl Serialize) -> usize {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .unwrap_or(usize::MAX)
 }
 
 fn agent_debug_info(
@@ -667,8 +1018,9 @@ fn settings_json(settings: &Settings, configured: bool) -> Value {
 }
 
 fn is_settings_configured(settings: &Settings) -> bool {
-    (normalize_browser_tools_mode(&settings.browser_tools_mode) != "mcp"
-        || !settings.mcp_url.trim().is_empty())
+    normalize_model_api_type(&settings.model_api_type) == "openai"
+        && (normalize_browser_tools_mode(&settings.browser_tools_mode) != "mcp"
+            || !settings.mcp_url.trim().is_empty())
         && !settings.model_base_url.trim().is_empty()
         && !settings.model_name.trim().is_empty()
         && !settings.api_key.trim().is_empty()
@@ -704,7 +1056,7 @@ fn normalize_model_api_type(value: &str) -> String {
 }
 
 fn default_browser_tools_mode() -> String {
-    "mcp".to_string()
+    "extension".to_string()
 }
 
 fn default_true() -> bool {
@@ -713,8 +1065,8 @@ fn default_true() -> bool {
 
 fn normalize_browser_tools_mode(value: &str) -> String {
     match value {
-        "extension" | "off" => value.to_string(),
-        _ => "mcp".to_string(),
+        "mcp" | "off" => value.to_string(),
+        _ => "extension".to_string(),
     }
 }
 
@@ -874,9 +1226,12 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn save_settings(settings: &Settings) -> io::Result<()> {
-    let Some(path) = settings_path() else {
-        return Ok(());
-    };
+    let path = settings_path().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "APPDATA or HOME is required to save settings",
+        )
+    })?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1356,24 +1711,66 @@ fn call_workspace_tool(root: &Path, name: &str, arguments: Value) -> Result<Valu
     }
 }
 
-fn call_extension_browser_tool(name: &str, arguments: Value) -> Result<Value, String> {
+fn call_extension_browser_tool(
+    bridge: &HostBridge,
+    run_context: Option<&RunContext>,
+    name: &str,
+    arguments: Value,
+) -> Result<Value, String> {
     let id = format!(
         "ext-tool-{}-{}",
         process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis())
-            .unwrap_or_default()
+        NEXT_EXTENSION_TOOL_ID.fetch_add(1, Ordering::Relaxed)
     );
-    write_message(&json!({
-        "event": "extension.tool.request",
-        "payload": {
-            "id": id,
-            "name": name,
-            "arguments": arguments,
+    let event_payload = json!({
+        "id": id,
+        "run_id": run_context.map(|context| context.run_id.as_str()),
+        "name": name,
+        "arguments": arguments,
+    });
+
+    if let Some(context) = run_context {
+        let (sender, receiver) = mpsc::channel();
+        bridge
+            .extension_waiters
+            .lock()
+            .map_err(|_| "failed to access extension tool waiters".to_string())?
+            .insert(id.clone(), sender);
+        if let Err(error) = bridge.send_event("extension.tool.request", event_payload) {
+            if let Ok(mut waiters) = bridge.extension_waiters.lock() {
+                waiters.remove(&id);
+            }
+            return Err(format!("failed to request extension tool {name}: {error}"));
         }
-    }))
-    .map_err(|error| format!("failed to request extension tool {name}: {error}"))?;
+
+        let deadline = Instant::now() + EXTENSION_TOOL_TIMEOUT;
+        loop {
+            if context.is_cancelled() {
+                if let Ok(mut waiters) = bridge.extension_waiters.lock() {
+                    waiters.remove(&id);
+                }
+                return Err("run cancelled".to_string());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                if let Ok(mut waiters) = bridge.extension_waiters.lock() {
+                    waiters.remove(&id);
+                }
+                return Err(format!("extension tool {name} timed out"));
+            }
+            match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
+                Ok(message) => return extension_tool_response(name, &message),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(format!("extension disconnected while running {name}"));
+                }
+            }
+        }
+    }
+
+    bridge
+        .send_event("extension.tool.request", event_payload)
+        .map_err(|error| format!("failed to request extension tool {name}: {error}"))?;
 
     loop {
         let Some(message) = read_message()
@@ -1387,16 +1784,20 @@ fn call_extension_browser_tool(name: &str, arguments: Value) -> Result<Value, St
             );
             continue;
         }
-        if let Some(error) = message.get("error") {
-            let text = error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| error.to_string());
-            return Err(format!("extension tool {name} failed: {text}"));
-        }
-        return Ok(message.get("result").cloned().unwrap_or_else(|| json!({})));
+        return extension_tool_response(name, &message);
     }
+}
+
+fn extension_tool_response(name: &str, message: &Value) -> Result<Value, String> {
+    if let Some(error) = message.get("error") {
+        let text = error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string());
+        return Err(format!("extension tool {name} failed: {text}"));
+    }
+    Ok(message.get("result").cloned().unwrap_or_else(|| json!({})))
 }
 
 fn workspace_ls(root: &Path, arguments: &Value) -> Result<Value, String> {
@@ -1842,10 +2243,10 @@ impl McpHttpClient {
             .send()
             .map_err(|error| format!("MCP request {method} failed: {error}"))?;
 
-        if let Some(session_id) = response.headers().get("mcp-session-id") {
-            if let Ok(session_id) = session_id.to_str() {
-                self.session_id = Some(session_id.to_string());
-            }
+        if let Some(session_id) = response.headers().get("mcp-session-id")
+            && let Ok(session_id) = session_id.to_str()
+        {
+            self.session_id = Some(session_id.to_string());
         }
 
         if !response.status().is_success() {
@@ -1894,14 +2295,12 @@ impl McpHttpClient {
             HeaderValue::from_static("application/json, text/event-stream"),
         );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if include_session {
-            if let Some(session_id) = &self.session_id {
-                headers.insert(
-                    "mcp-session-id",
-                    HeaderValue::from_str(session_id)
-                        .map_err(|error| format!("invalid MCP session id: {error}"))?,
-                );
-            }
+        if include_session && let Some(session_id) = &self.session_id {
+            headers.insert(
+                "mcp-session-id",
+                HeaderValue::from_str(session_id)
+                    .map_err(|error| format!("invalid MCP session id: {error}"))?,
+            );
         }
         Ok(headers)
     }
@@ -2037,9 +2436,157 @@ fn trim_trailing_underscores(value: &str) -> &str {
     value.trim_end_matches('_')
 }
 
+fn ok(id: String, result: Value) -> Response {
+    Response {
+        id,
+        result: Some(result),
+        error: None,
+    }
+}
+
+fn err(id: String, code: &str, message: &str) -> Response {
+    Response {
+        id,
+        result: None,
+        error: Some(ErrorBody {
+            code: code.to_string(),
+            message: message.to_string(),
+        }),
+    }
+}
+
+fn read_message() -> io::Result<Option<Value>> {
+    let mut length_bytes = [0_u8; 4];
+    match io::stdin().read_exact(&mut length_bytes) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error),
+    }
+
+    let length = u32::from_le_bytes(length_bytes) as usize;
+    if length > MAX_INBOUND_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message too large: {length} bytes"),
+        ));
+    }
+
+    let mut buffer = vec![0_u8; length];
+    io::stdin().read_exact(&mut buffer)?;
+    let value = serde_json::from_slice(&buffer).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid JSON payload: {error}"),
+        )
+    })?;
+    Ok(Some(value))
+}
+
+fn write_message(value: &Value) -> io::Result<()> {
+    let payload = serde_json::to_vec(value).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to encode JSON: {error}"),
+        )
+    })?;
+    let length = u32::try_from(payload.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "outbound message is too large"))?;
+
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&length.to_le_bytes())?;
+    stdout.write_all(&payload)?;
+    stdout.flush()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_bridge() -> (HostBridge, mpsc::Receiver<Value>) {
+        let (outbound, output) = mpsc::channel();
+        (
+            HostBridge {
+                outbound,
+                extension_waiters: Arc::new(Mutex::new(HashMap::new())),
+            },
+            output,
+        )
+    }
+
+    #[test]
+    fn extension_tool_responses_are_routed_to_the_registered_waiter() {
+        let (bridge, _output) = test_bridge();
+        let (sender, receiver) = mpsc::channel();
+        bridge
+            .extension_waiters
+            .lock()
+            .unwrap()
+            .insert("ext-tool-test".to_string(), sender);
+        let message = json!({ "id": "ext-tool-test", "result": { "ok": true } });
+
+        assert!(bridge.route_extension_response(&message));
+        assert_eq!(receiver.recv().unwrap(), message);
+        assert!(bridge.extension_waiters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_run_acknowledges_and_emits_an_event() {
+        let (bridge, output) = test_bridge();
+        let runs: RunRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        runs.lock()
+            .unwrap()
+            .insert("run-test".to_string(), cancelled.clone());
+
+        cancel_agent_run(
+            Request {
+                id: "cancel-request".to_string(),
+                method: "agent.cancel".to_string(),
+                params: json!({ "run_id": "run-test" }),
+            },
+            &bridge,
+            &runs,
+        );
+
+        assert!(cancelled.load(Ordering::SeqCst));
+        let response = output.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(response["id"], "cancel-request");
+        assert_eq!(response["result"]["state"], "cancelled");
+        let event = output.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "agent.cancelled");
+        assert_eq!(event["payload"]["run_id"], "run-test");
+    }
+
+    #[test]
+    fn agent_start_returns_before_the_run_error_event() {
+        let (bridge, output) = test_bridge();
+        let runs: RunRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let settings = Settings {
+            workspace_dir: String::new(),
+            browser_tools_mode: "off".to_string(),
+            ..Settings::default()
+        };
+        start_agent_run(
+            Request {
+                id: "start-request".to_string(),
+                method: "agent.start".to_string(),
+                params: json!({ "message": "hello", "mode": "chat" }),
+            },
+            &settings,
+            &bridge,
+            &runs,
+        );
+
+        let response = output.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(response["id"], "start-request");
+        let run_id = response["result"]["run_id"].as_str().unwrap();
+        let status = output.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(status["event"], "agent.status");
+        assert_eq!(status["payload"]["run_id"], run_id);
+        let error = output.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(error["event"], "agent.error");
+        assert_eq!(error["payload"]["run_id"], run_id);
+    }
 
     #[test]
     fn safe_tool_names_keep_valid_names() {
@@ -2112,6 +2659,67 @@ mod tests {
         assert!(context.contains("tabId=42"));
         assert!(context.contains("title=\"Example\""));
         assert!(context.contains("url=https://example.com"));
+    }
+
+    #[test]
+    fn conversation_history_keeps_recent_supported_messages() {
+        let items = (0..30)
+            .map(|index| {
+                json!({
+                    "role": if index % 2 == 0 { "user" } else { "assistant" },
+                    "content": format!("message {index}")
+                })
+            })
+            .collect::<Vec<_>>();
+        let history = conversation_history(&json!({ "history": items }));
+
+        assert_eq!(history.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(history[0]["content"], "message 6");
+        let messages = initial_agent_messages("system prompt", &history, "current message");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"], "message 6");
+        assert_eq!(messages.last().unwrap()["content"], "current message");
+    }
+
+    #[test]
+    fn conversation_history_rejects_unsupported_or_oversized_entries() {
+        let history = conversation_history(&json!({
+            "history": [
+                { "role": "system", "content": "ignore me" },
+                { "role": "user", "content": "" },
+                { "role": "assistant", "content": "x".repeat(MAX_HISTORY_BYTES + 1) },
+                { "role": "user", "content": "keep me" },
+                { "role": "assistant", "content": "keep response" },
+                { "role": "user", "content": "drop incomplete turn" }
+            ]
+        }));
+
+        assert_eq!(
+            history,
+            vec![
+                json!({ "role": "user", "content": "keep me" }),
+                json!({ "role": "assistant", "content": "keep response" })
+            ]
+        );
+    }
+
+    #[test]
+    fn new_settings_default_to_extension_browser_tools() {
+        assert_eq!(Settings::default().browser_tools_mode, "extension");
+    }
+
+    #[test]
+    fn settings_updates_reject_unsupported_provider_without_mutating_current() {
+        let current = Settings::default();
+        let error = settings_with_updates(
+            &current,
+            &json!({ "model_api_type": "anthropic", "model_name": "ignored" }),
+        )
+        .expect_err("unsupported provider should fail");
+
+        assert!(error.contains("unsupported model API type"));
+        assert_eq!(current.model_name, "");
+        assert_eq!(current.model_api_type, "openai");
     }
 
     #[test]
@@ -2220,13 +2828,15 @@ mod tests {
 
     #[test]
     fn extension_browser_mode_does_not_require_mcp_url() {
-        let mut settings = Settings::default();
-        settings.browser_tools_mode = "extension".to_string();
-        settings.mcp_url = String::new();
-        settings.workspace_dir = String::new();
-        settings.model_base_url = "https://api.openai.com/v1".to_string();
-        settings.model_name = "test-model".to_string();
-        settings.api_key = "test-key".to_string();
+        let settings = Settings {
+            browser_tools_mode: "extension".to_string(),
+            mcp_url: String::new(),
+            workspace_dir: String::new(),
+            model_base_url: "https://api.openai.com/v1".to_string(),
+            model_name: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            ..Settings::default()
+        };
 
         assert!(is_settings_configured(&settings));
         let prepared = prepare_llm_tools(&settings, true).expect("prepare extension tools");
@@ -2259,76 +2869,4 @@ mod tests {
         fs::create_dir_all(&root).expect("create test workspace");
         fs::canonicalize(root).expect("canonical test workspace")
     }
-}
-
-fn ok(id: String, result: Value) -> Response {
-    Response {
-        id,
-        result: Some(result),
-        error: None,
-    }
-}
-
-fn err(id: String, code: &str, message: &str) -> Response {
-    Response {
-        id,
-        result: None,
-        error: Some(ErrorBody {
-            code: code.to_string(),
-            message: message.to_string(),
-        }),
-    }
-}
-
-fn read_message() -> io::Result<Option<Value>> {
-    let mut length_bytes = [0_u8; 4];
-    match io::stdin().read_exact(&mut length_bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-
-    let length = u32::from_le_bytes(length_bytes) as usize;
-    if length > MAX_INBOUND_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("message too large: {length} bytes"),
-        ));
-    }
-
-    let mut buffer = vec![0_u8; length];
-    io::stdin().read_exact(&mut buffer)?;
-    let value = serde_json::from_slice(&buffer).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid JSON payload: {error}"),
-        )
-    })?;
-    Ok(Some(value))
-}
-
-fn write_response(response: &Response) -> io::Result<()> {
-    let value = serde_json::to_value(response).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to encode response: {error}"),
-        )
-    })?;
-    write_message(&value)
-}
-
-fn write_message(value: &Value) -> io::Result<()> {
-    let payload = serde_json::to_vec(value).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to encode JSON: {error}"),
-        )
-    })?;
-    let length = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "outbound message is too large"))?;
-
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(&length.to_le_bytes())?;
-    stdout.write_all(&payload)?;
-    stdout.flush()
 }

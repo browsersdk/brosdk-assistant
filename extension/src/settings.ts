@@ -4,7 +4,7 @@ export const DEFAULT_SETTINGS: SettingsResult = {
   configured: false,
   workspace_dir: '.',
   default_workspace_dir: undefined,
-  browser_tools_mode: 'mcp',
+  browser_tools_mode: 'extension',
   mcp_url: 'http://127.0.0.1:3000/mcp',
   model_base_url: '',
   model_name: '',
@@ -21,7 +21,8 @@ export function isSettingsConfigured(settings: SettingsResult) {
 
 function hasRequiredSettings(settings: Partial<SettingsResult>) {
   return Boolean(
-    (settings.browser_tools_mode !== 'mcp' || settings.mcp_url?.trim()) &&
+    settings.model_api_type === 'openai' &&
+      (settings.browser_tools_mode !== 'mcp' || settings.mcp_url?.trim()) &&
       settings.model_base_url?.trim() &&
       settings.model_name?.trim() &&
       settings.api_key?.trim(),
@@ -33,8 +34,8 @@ export function normalizeModelApiType(value: string): ModelApiType {
 }
 
 export function normalizeBrowserToolsMode(value?: string): BrowserToolsMode {
-  if (value === 'extension' || value === 'off') return value
-  return 'mcp'
+  if (value === 'mcp' || value === 'off') return value
+  return 'extension'
 }
 
 export function normalizeSettings(settings?: Partial<SettingsResult> | null): SettingsResult {

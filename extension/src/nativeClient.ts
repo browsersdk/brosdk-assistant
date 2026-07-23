@@ -1,11 +1,8 @@
 import type { BackgroundRequest, BackgroundResponse, NativeStatus } from './types'
 
-let nextId = 0
-
 export function createRequest(method: string, params?: unknown) {
-  nextId += 1
   return {
-    id: String(nextId),
+    id: `ui-${Date.now()}-${crypto.randomUUID()}`,
     method,
     params,
   }
@@ -31,4 +28,3 @@ export async function getNativeStatus(): Promise<NativeStatus> {
   }
   return response.data
 }
-
