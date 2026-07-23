@@ -115,9 +115,10 @@ Status: in progress. The `run_id` protocol, concurrent request routing, SSE
 cooperative cancellation, host-owned bounded conversations, per-side-panel
 event routing, cancellable model HTTP I/O, and DeepSeek E2E coverage are
 implemented. The OpenAI provider, Native Messaging protocol, and agent run
-coordination and scoped workspace tools have been extracted from `main.rs`.
-Remaining extraction is limited to MCP boundaries that improve protocol
-testability; broader integration tests remain the more important release gate.
+coordination, scoped workspace tools, and generic MCP transport have been
+extracted from `main.rs`. MCP initialization, discovery, invocation, session,
+SSE, and error paths now have local HTTP integration coverage. Broader native
+and Chrome integration tests remain the release gate.
 
 - Add `run_id` based asynchronous agent protocol.
 - Stream model deltas and tool progress events.

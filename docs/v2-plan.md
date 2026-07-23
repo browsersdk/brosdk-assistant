@@ -205,8 +205,6 @@ Implemented behavior:
 
 Remaining v0.2.0 work:
 
-- add MCP initialization, discovery, invocation, and error-path integration
-  tests before deciding whether to extract `tools/mcp.rs`,
 - add broader native protocol and Chrome integration tests.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
@@ -285,6 +283,9 @@ src/
 
 Current progress:
 
+- `tools/mcp.rs` owns generic Streamable HTTP session setup, notifications,
+  tool discovery and invocation, JSON/SSE responses, session headers, and
+  transport errors. Local HTTP integration tests cover its full lifecycle.
 - `tools/workspace.rs` owns workspace schemas, read/write/search execution,
   path and symlink containment, and workspace security tests.
 - `agent/run.rs` owns run and conversation registries, run lifecycle events,
@@ -296,8 +297,9 @@ Current progress:
 - `providers/openai.rs` owns OpenAI-compatible endpoint construction, blocking
   compatibility requests, cancellable streaming requests, SSE decoding, and
   provider-specific tests.
-- `main.rs` owns the model/tool execution loop, MCP and extension-tool
-  orchestration, and translates provider deltas into native events.
+- `main.rs` owns the model/tool execution loop, MCP policy and provider mapping,
+  extension-tool orchestration, and translates provider deltas into native
+  events.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not
