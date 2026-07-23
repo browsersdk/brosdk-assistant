@@ -24,9 +24,11 @@ cargo build --release
 ```powershell
 cd extension
 npm install
+npx playwright install chromium
 npm run generate:icons
 npm run typecheck
 npm run build
+npm run test:extension-smoke
 ```
 
 ## Package Windows Release
@@ -37,8 +39,10 @@ Use the release packager from the repository root:
 python scripts\package_release.py --version 0.1.0
 ```
 
-The script runs extension typecheck/build/zip, runs native-host tests, builds
-the release native host, and writes release assets to `.output/release/`:
+The script runs extension typecheck, the Chrome smoke test, build/zip,
+native-host tests, and the release native-host build, then writes release assets
+to `.output/release/`. Install Playwright Chromium once before packaging with
+`cd extension; npx playwright install chromium`.
 
 - `brosdk-assistant-v0.1.0-windows.zip` - Windows install package.
 - `brosdk-assistant-extension-v0.1.0-chrome.zip` - standalone extension zip.
@@ -118,6 +122,22 @@ credentials:
 
 ```powershell
 python scripts\test_native_protocol_e2e.py
+```
+
+## Chrome Extension Smoke Test
+
+The extension smoke test launches a test-mode MV3 build in Playwright Chromium,
+opens a controlled local page, and verifies tab discovery, active-tab
+resolution, page reading, actionable-element snapshots, link extraction,
+typing, clicking, and navigation through the real background service worker and
+Chrome extension APIs. The internal test bridge is compiled out of production
+builds.
+
+Install the Playwright browser once, then run the test from `extension/`:
+
+```powershell
+npx playwright install chromium
+npm run test:extension-smoke
 ```
 
 ## DeepSeek End-to-End Test

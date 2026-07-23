@@ -164,6 +164,8 @@ def build(skip_build: bool, skip_tests: bool) -> None:
     cargo = command_name("cargo")
 
     run([npm, "run", "typecheck"], EXTENSION_DIR)
+    if not skip_tests:
+        run([npm, "run", "test:extension-smoke"], EXTENSION_DIR)
     run([npm, "run", "build"], EXTENSION_DIR)
     run([npm, "run", "zip"], EXTENSION_DIR)
 
@@ -240,7 +242,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--version", default=read_extension_version(), help="Release version. Defaults to extension/package.json.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Release output directory.")
     parser.add_argument("--skip-build", action="store_true", help="Only package existing build outputs.")
-    parser.add_argument("--skip-tests", action="store_true", help="Skip cargo test while building.")
+    parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="Skip the Chrome extension smoke test and cargo test while building.",
+    )
     return parser.parse_args()
 
 

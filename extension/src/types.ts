@@ -31,6 +31,11 @@ export type BackgroundRequest =
       settings: SettingsResult
     }
   | {
+      type: 'extension.tool.invoke'
+      name: string
+      arguments?: unknown
+    }
+  | {
       type: 'native.event'
       event: NativeEvent
     }

@@ -79,7 +79,6 @@ Known gaps:
 - Anthropic is not implemented,
 - extension element refs are not stable across page changes,
 - destructive actions have no confirmation layer,
-- Chrome extension smoke coverage is still missing,
 - installation is still a developer-oriented workflow.
 
 ## Milestones
@@ -109,7 +108,7 @@ Exit criteria:
 
 Goal: make runs observable, cancellable, concurrent-safe, and testable.
 
-Status: in progress. The `run_id` protocol, concurrent request routing, SSE
+Status: completed. The `run_id` protocol, concurrent request routing, SSE
 `agent.delta` output, streamed tool-call reconstruction, tool events,
 cooperative cancellation, host-owned bounded conversations, per-side-panel
 event routing, cancellable model HTTP I/O, and DeepSeek E2E coverage are
@@ -118,7 +117,8 @@ coordination, scoped workspace tools, and generic MCP transport have been
 extracted from `main.rs`. MCP initialization, discovery, invocation, session,
 SSE, and error paths now have local HTTP integration coverage. A deterministic
 native protocol E2E covers concurrent routing, streaming, and extension-tool
-correlation. Chrome integration tests remain the release gate.
+correlation. A Playwright smoke test loads the built MV3 extension and verifies
+the Chrome browser-tool path against a controlled local page.
 
 - Add `run_id` based asynchronous agent protocol.
 - Stream model deltas and tool progress events.
@@ -208,9 +208,10 @@ The roadmap should be judged by behavior, not feature count:
 
 ## Immediate Implementation Order
 
-1. Commit and package the v0.1.1 truthful baseline.
-2. Design and test the `run_id` protocol before adding more browser tools.
-3. Move the native host to concurrent-safe run coordination.
-4. Add streaming, cancellation, and host-owned conversation state.
-5. Improve browser action quality and confirmations.
+1. Bind extension snapshot refs to tab and document revisions.
+2. Improve controlled-input typing, navigation waits, and action diagnostics.
+3. Add wait, scroll, select, keyboard, tab lifecycle, and screenshot tools.
+4. Add confirmation decisions for sensitive browser and workspace mutations.
+5. Expand the controlled browser suite to summaries, forms, navigation, and
+   cancellation.
 6. Harden packaging, security, and cross-platform installation.

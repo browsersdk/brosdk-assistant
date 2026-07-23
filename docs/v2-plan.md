@@ -203,9 +203,9 @@ Implemented behavior:
   exposes `conversation.get` and `conversation.reset`,
 - `agent.run` remains as a blocking compatibility entrypoint.
 
-Remaining v0.2.0 work:
-
-- add a Chrome extension smoke test using a controlled local page.
+The v0.2.0 reliability gate is complete. The next browser work belongs to the
+v0.3.0 trustworthy-agent milestone: stable element references, richer actions,
+confirmation policy, and broader browser task coverage.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
 debug traces, page data, and tool results must be chunked or fetched separately
@@ -303,6 +303,10 @@ Current progress:
 - `scripts/test_native_protocol_e2e.py` drives the compiled host through Native
   Messaging with a local mock model, including concurrent health routing,
   streamed deltas, extension tool correlation, and a two-round agent response.
+- `extension/scripts/test-extension-smoke.mjs` loads a test-mode MV3 build in
+  Playwright Chromium and verifies tabs, page reads, snapshots, links, typing,
+  clicking, and navigation against a controlled local page. Its internal tool
+  bridge is compiled out of production builds.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not
@@ -314,8 +318,10 @@ Every release must pass:
 
 ```powershell
 cd extension
+npx playwright install chromium
 npm run typecheck
 npm run build
+npm run test:extension-smoke
 
 cd ..\native-host
 cargo fmt --check
@@ -326,6 +332,10 @@ cd ..
 python scripts\test_native_protocol_e2e.py
 ```
 
+`scripts/package_release.py` runs the extension smoke test and native unit tests
+unless `--skip-tests` is explicitly supplied. It rebuilds the production
+extension after the test-mode build before creating release archives.
+
 When a DeepSeek test key is available, run the real-provider E2E without
 persisting credentials in the repository:
 
@@ -335,7 +345,7 @@ python ..\scripts\test_deepseek_e2e.py --model deepseek-v4-flash
 Remove-Item Env:DEEPSEEK_API_KEY
 ```
 
-The v0.2.0 gate also requires automated coverage for:
+The completed v0.2.0 gate has automated coverage for:
 
 - settings round trips and save failures,
 - multi-turn context ordering and limits,

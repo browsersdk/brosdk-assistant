@@ -332,7 +332,7 @@ export default defineBackground(() => {
     openConfiguredSidePanel(tab)
   })
 
-  chrome.runtime.onMessage.addListener((message: BackgroundRequest, _sender, sendResponse) => {
+  chrome.runtime.onMessage.addListener((message: BackgroundRequest, sender, sendResponse) => {
     if (message?.type === 'native.status') {
       sendResponse({ ok: true, data: status() } satisfies BackgroundResponse<NativeStatus>)
       return false
@@ -353,6 +353,24 @@ export default defineBackground(() => {
       void configureSidePanel(message.settings)
       sendResponse({ ok: true } satisfies BackgroundResponse)
       return false
+    }
+
+    if (import.meta.env.MODE === 'test' && message?.type === 'extension.tool.invoke') {
+      if (sender.id !== chrome.runtime.id) {
+        sendResponse({
+          ok: false,
+          error: 'Extension tool requests must be internal',
+        } satisfies BackgroundResponse)
+        return false
+      }
+      callExtensionBrowserTool(message.name, message.arguments)
+        .then((data) => {
+          sendResponse({ ok: true, data } satisfies BackgroundResponse)
+        })
+        .catch((error: Error) => {
+          sendResponse({ ok: false, error: error.message } satisfies BackgroundResponse)
+        })
+      return true
     }
 
     return false
