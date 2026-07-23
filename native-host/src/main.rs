@@ -1,5 +1,7 @@
+mod protocol;
 mod providers;
 
+use protocol::{HostBridge, Request, Response, err, ok, read_message, start_stdout_bridge};
 use providers::openai::OpenAiProvider;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
@@ -9,18 +11,17 @@ use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const SERVICE_NAME: &str = "brosdk-assistant-native";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const MAX_INBOUND_BYTES: usize = 16 * 1024 * 1024;
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const OPENAI_TOOL_NAME_MAX_LENGTH: usize = 64;
 const MAX_OPENAI_TOOL_ROUNDS: usize = 6;
@@ -33,29 +34,6 @@ static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_EXTENSION_TOOL_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_CONVERSATION_UPDATE: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Debug, Deserialize)]
-struct Request {
-    id: String,
-    method: String,
-    #[serde(default)]
-    params: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct Response {
-    id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<ErrorBody>,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorBody {
-    code: String,
-    message: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Settings {
@@ -89,46 +67,6 @@ type ConversationRegistry = Arc<Mutex<HashMap<String, Conversation>>>;
 struct Conversation {
     messages: Vec<Value>,
     updated_at: u64,
-}
-
-#[derive(Clone)]
-struct HostBridge {
-    outbound: Sender<Value>,
-    extension_waiters: Arc<Mutex<HashMap<String, Sender<Value>>>>,
-}
-
-impl HostBridge {
-    fn send(&self, value: Value) -> Result<(), String> {
-        self.outbound
-            .send(value)
-            .map_err(|_| "native output channel is closed".to_string())
-    }
-
-    fn send_response(&self, response: Response) -> Result<(), String> {
-        let value = serde_json::to_value(response)
-            .map_err(|error| format!("failed to encode response: {error}"))?;
-        self.send(value)
-    }
-
-    fn send_event(&self, event: &str, payload: Value) -> Result<(), String> {
-        self.send(json!({ "event": event, "payload": payload }))
-    }
-
-    fn route_extension_response(&self, message: &Value) -> bool {
-        let Some(id) = message.get("id").and_then(Value::as_str) else {
-            return false;
-        };
-        let waiter = self
-            .extension_waiters
-            .lock()
-            .ok()
-            .and_then(|mut waiters| waiters.remove(id));
-        if let Some(waiter) = waiter {
-            let _ = waiter.send(message.clone());
-            return true;
-        }
-        false
-    }
 }
 
 #[derive(Clone)]
@@ -193,19 +131,7 @@ impl Default for Settings {
 
 fn main() {
     let (mut settings, mut settings_configured) = load_settings();
-    let (outbound, output) = mpsc::channel::<Value>();
-    thread::spawn(move || {
-        for value in output {
-            if let Err(error) = write_message(&value) {
-                eprintln!("[native] write failed: {error}");
-                break;
-            }
-        }
-    });
-    let bridge = HostBridge {
-        outbound,
-        extension_waiters: Arc::new(Mutex::new(HashMap::new())),
-    };
+    let bridge = start_stdout_bridge();
     let runs: RunRegistry = Arc::new(Mutex::new(HashMap::new()));
     let conversations: ConversationRegistry = Arc::new(Mutex::new(HashMap::new()));
     let ready = json!({
@@ -1986,32 +1912,21 @@ fn call_extension_browser_tool(
     });
 
     if let Some(context) = run_context {
-        let (sender, receiver) = mpsc::channel();
-        bridge
-            .extension_waiters
-            .lock()
-            .map_err(|_| "failed to access extension tool waiters".to_string())?
-            .insert(id.clone(), sender);
+        let receiver = bridge.register_extension_waiter(id.clone())?;
         if let Err(error) = bridge.send_event("extension.tool.request", event_payload) {
-            if let Ok(mut waiters) = bridge.extension_waiters.lock() {
-                waiters.remove(&id);
-            }
+            bridge.remove_extension_waiter(&id);
             return Err(format!("failed to request extension tool {name}: {error}"));
         }
 
         let deadline = Instant::now() + EXTENSION_TOOL_TIMEOUT;
         loop {
             if context.is_cancelled() {
-                if let Ok(mut waiters) = bridge.extension_waiters.lock() {
-                    waiters.remove(&id);
-                }
+                bridge.remove_extension_waiter(&id);
                 return Err("run cancelled".to_string());
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                if let Ok(mut waiters) = bridge.extension_waiters.lock() {
-                    waiters.remove(&id);
-                }
+                bridge.remove_extension_waiter(&id);
                 return Err(format!("extension tool {name} timed out"));
             }
             match receiver.recv_timeout(remaining.min(Duration::from_millis(100))) {
@@ -2692,97 +2607,14 @@ fn trim_trailing_underscores(value: &str) -> &str {
     value.trim_end_matches('_')
 }
 
-fn ok(id: String, result: Value) -> Response {
-    Response {
-        id,
-        result: Some(result),
-        error: None,
-    }
-}
-
-fn err(id: String, code: &str, message: &str) -> Response {
-    Response {
-        id,
-        result: None,
-        error: Some(ErrorBody {
-            code: code.to_string(),
-            message: message.to_string(),
-        }),
-    }
-}
-
-fn read_message() -> io::Result<Option<Value>> {
-    let mut length_bytes = [0_u8; 4];
-    match io::stdin().read_exact(&mut length_bytes) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error),
-    }
-
-    let length = u32::from_le_bytes(length_bytes) as usize;
-    if length > MAX_INBOUND_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("message too large: {length} bytes"),
-        ));
-    }
-
-    let mut buffer = vec![0_u8; length];
-    io::stdin().read_exact(&mut buffer)?;
-    let value = serde_json::from_slice(&buffer).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("invalid JSON payload: {error}"),
-        )
-    })?;
-    Ok(Some(value))
-}
-
-fn write_message(value: &Value) -> io::Result<()> {
-    let payload = serde_json::to_vec(value).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to encode JSON: {error}"),
-        )
-    })?;
-    let length = u32::try_from(payload.len())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "outbound message is too large"))?;
-
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(&length.to_le_bytes())?;
-    stdout.write_all(&payload)?;
-    stdout.flush()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     fn test_bridge() -> (HostBridge, mpsc::Receiver<Value>) {
         let (outbound, output) = mpsc::channel();
-        (
-            HostBridge {
-                outbound,
-                extension_waiters: Arc::new(Mutex::new(HashMap::new())),
-            },
-            output,
-        )
-    }
-
-    #[test]
-    fn extension_tool_responses_are_routed_to_the_registered_waiter() {
-        let (bridge, _output) = test_bridge();
-        let (sender, receiver) = mpsc::channel();
-        bridge
-            .extension_waiters
-            .lock()
-            .unwrap()
-            .insert("ext-tool-test".to_string(), sender);
-        let message = json!({ "id": "ext-tool-test", "result": { "ok": true } });
-
-        assert!(bridge.route_extension_response(&message));
-        assert_eq!(receiver.recv().unwrap(), message);
-        assert!(bridge.extension_waiters.lock().unwrap().is_empty());
+        (HostBridge::new(outbound), output)
     }
 
     #[test]

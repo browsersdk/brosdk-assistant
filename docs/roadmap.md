@@ -76,7 +76,7 @@ Available today:
 Known gaps:
 
 - host-owned conversation state is memory-only and not searchable or persisted,
-- most native protocol, agent, and tool code remains concentrated in `main.rs`,
+- most native agent and tool code remains concentrated in `main.rs`,
 - Anthropic is not implemented,
 - extension element refs are not stable across page changes,
 - destructive actions have no confirmation layer,
@@ -114,8 +114,9 @@ Status: in progress. The `run_id` protocol, concurrent request routing, SSE
 `agent.delta` output, streamed tool-call reconstruction, tool events,
 cooperative cancellation, host-owned bounded conversations, per-side-panel
 event routing, cancellable model HTTP I/O, and DeepSeek E2E coverage are
-implemented. The OpenAI provider has been extracted from `main.rs`; protocol,
-agent, and tool extraction plus broader integration tests remain.
+implemented. The OpenAI provider and Native Messaging protocol have been
+extracted from `main.rs`; agent and tool extraction plus broader integration
+tests remain.
 
 - Add `run_id` based asynchronous agent protocol.
 - Stream model deltas and tool progress events.

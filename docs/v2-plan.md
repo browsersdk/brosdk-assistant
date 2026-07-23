@@ -205,8 +205,7 @@ Implemented behavior:
 
 Remaining v0.2.0 work:
 
-- extract Native Messaging protocol, agent coordination, and tool ownership
-  from `main.rs`.
+- extract agent coordination and tool ownership from `main.rs`.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
 debug traces, page data, and tool results must be chunked or fetched separately
@@ -284,6 +283,9 @@ src/
 
 Current progress:
 
+- `protocol.rs` owns Native Messaging request and response types, bounded
+  length-prefixed framing, serialized stdout writes, extension response
+  correlation, and protocol-specific tests.
 - `providers/openai.rs` owns OpenAI-compatible endpoint construction, blocking
   compatibility requests, cancellable streaming requests, SSE decoding, and
   provider-specific tests.
