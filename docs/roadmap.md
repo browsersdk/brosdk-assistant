@@ -115,8 +115,9 @@ Status: in progress. The `run_id` protocol, concurrent request routing, SSE
 cooperative cancellation, host-owned bounded conversations, per-side-panel
 event routing, cancellable model HTTP I/O, and DeepSeek E2E coverage are
 implemented. The OpenAI provider, Native Messaging protocol, and agent run
-coordination have been extracted from `main.rs`; tool extraction plus broader
-integration tests remain.
+coordination have been extracted from `main.rs`. Remaining extraction is
+limited to tool boundaries that improve policy enforcement or testability;
+broader integration tests remain the more important release gate.
 
 - Add `run_id` based asynchronous agent protocol.
 - Stream model deltas and tool progress events.

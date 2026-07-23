@@ -205,7 +205,9 @@ Implemented behavior:
 
 Remaining v0.2.0 work:
 
-- extract tool ownership from `main.rs`.
+- extract workspace and MCP tool ownership where doing so creates a clearer
+  security or protocol-test boundary,
+- add broader native protocol and Chrome integration tests.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
 debug traces, page data, and tool results must be chunked or fetched separately
@@ -292,11 +294,12 @@ Current progress:
 - `providers/openai.rs` owns OpenAI-compatible endpoint construction, blocking
   compatibility requests, cancellable streaming requests, SSE decoding, and
   provider-specific tests.
-- `main.rs` owns run coordination and translates provider deltas into native
-  events.
+- `main.rs` owns the model/tool execution loop and translates provider deltas
+  into native events.
 
 Continue the split in small verified steps, preserving protocol behavior after
-each extracted module.
+each extracted module. The target tree is directional, not a checklist: do not
+extract code that would only add pass-through types or circular dependencies.
 
 ## Verification Strategy
 
