@@ -205,6 +205,32 @@ export function App() {
         setHealth({ kind: 'checking', text })
         return
       }
+      if (event.event === 'agent.delta' && payload.delta) {
+        setMessages((current) => {
+          const index = current.findIndex(
+            (message) => message.runId === payload.run_id && message.streaming,
+          )
+          if (index < 0) {
+            return [
+              ...current,
+              {
+                id: createId(),
+                role: 'assistant',
+                content: payload.delta || '',
+                time: nowLabel(),
+                runId: payload.run_id,
+                streaming: true,
+              },
+            ]
+          }
+          return current.map((message, messageIndex) =>
+            messageIndex === index
+              ? { ...message, content: `${message.content}${payload.delta || ''}` }
+              : message,
+          )
+        })
+        return
+      }
       if (event.event === 'agent.tool.started') {
         setHealth({ kind: 'checking', text: `Using ${payload.tool_name || 'tool'}...` })
         return
@@ -220,16 +246,33 @@ export function App() {
         return
       }
       if (event.event === 'agent.done' && payload.result) {
-        setMessages((current) => [
-          ...current,
-          {
-            id: createId(),
-            role: 'assistant',
-            content: payload.result?.message || 'Completed.',
-            time: nowLabel(),
-            debug: payload.result?.debug,
-          },
-        ])
+        setMessages((current) => {
+          const index = current.findIndex(
+            (message) => message.runId === payload.run_id && message.streaming,
+          )
+          if (index < 0) {
+            return [
+              ...current,
+              {
+                id: createId(),
+                role: 'assistant',
+                content: payload.result?.message || 'Completed.',
+                time: nowLabel(),
+                debug: payload.result?.debug,
+              },
+            ]
+          }
+          return current.map((message, messageIndex) =>
+            messageIndex === index
+              ? {
+                  ...message,
+                  content: payload.result?.message || message.content || 'Completed.',
+                  debug: payload.result?.debug,
+                  streaming: false,
+                }
+              : message,
+          )
+        })
         setAttachedTabs([])
         setHealth({ kind: 'online', text: 'Completed' })
         finishActiveRun(payload.run_id)
@@ -238,7 +281,9 @@ export function App() {
       if (event.event === 'agent.error') {
         const text = payload.error?.message || 'Agent run failed'
         setMessages((current) => [
-          ...current,
+          ...current.filter(
+            (message) => !(message.runId === payload.run_id && message.streaming),
+          ),
           { id: createId(), role: 'error', content: text, time: nowLabel() },
         ])
         setHealth({ kind: 'error', text })
@@ -246,6 +291,9 @@ export function App() {
         return
       }
       if (event.event === 'agent.cancelled') {
+        setMessages((current) =>
+          current.filter((message) => !(message.runId === payload.run_id && message.streaming)),
+        )
         setHealth({ kind: 'idle', text: 'Cancelled' })
         finishActiveRun(payload.run_id)
       }

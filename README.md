@@ -120,8 +120,9 @@ The API key is read only from the environment and is not written to the
 repository.
 
 The test also verifies the asynchronous `agent.start` protocol, concurrent
-`agent.health` routing during a model run, tool progress events, and
-`agent.cancel` acknowledgement.
+`agent.health` routing during a model run, streamed `agent.delta` output,
+streamed tool-call reconstruction, tool progress events, and `agent.cancel`
+acknowledgement.
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "<temporary-api-key>"

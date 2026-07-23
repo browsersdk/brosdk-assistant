@@ -85,6 +85,7 @@ export type AgentEventPayload = {
   tool_call_id?: string
   tool_name?: string
   ok?: boolean
+  delta?: string
 }
 
 export type AgentRunDebugInfo = {
@@ -146,4 +147,6 @@ export type ChatMessage = {
   content: string
   time: string
   debug?: AgentRunDebugInfo
+  runId?: string
+  streaming?: boolean
 }

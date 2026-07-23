@@ -284,8 +284,18 @@ def run_test(args: argparse.Namespace, api_key: str) -> None:
             )
             event_names = [event.get("event") for event in first_events]
             require("agent.status" in event_names, "run did not emit status events")
+            require("agent.delta" in event_names, "run did not emit model deltas")
             require("agent.tool.started" in event_names, "run did not emit tool start")
             require("agent.tool.finished" in event_names, "run did not emit tool finish")
+            streamed_text = "".join(
+                str((event.get("payload") or {}).get("delta", ""))
+                for event in first_events
+                if event.get("event") == "agent.delta"
+            )
+            require(
+                verification_token.lower() in streamed_text.lower(),
+                "streamed deltas did not contain the final verification token",
+            )
             require(
                 verification_token.lower() in first_answer.lower(),
                 "workspace-backed response did not contain the verification token",

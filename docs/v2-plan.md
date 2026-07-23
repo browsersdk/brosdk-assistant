@@ -168,6 +168,7 @@ Starting a run returns a `run_id` immediately:
 The host then emits bounded events:
 
 - `agent.status`
+- `agent.delta`
 - `agent.tool.started`
 - `agent.tool.finished`
 - `agent.done`
@@ -184,14 +185,15 @@ Implemented behavior:
 - the main input loop remains available while runs execute on worker threads,
 - extension-tool responses are correlated through per-call waiters,
 - cancellation is acknowledged immediately and suppresses late run events,
+- OpenAI-compatible SSE content is forwarded through `agent.delta`,
+- streamed tool-call ids, names, and arguments are reconstructed by index,
 - tool failures are returned to the model when recovery is possible,
 - `agent.run` remains as a blocking compatibility entrypoint.
 
 Remaining v0.2.0 work:
 
-- stream provider output through `agent.delta`,
-- interrupt an in-flight blocking HTTP request instead of only suppressing its
-  late result,
+- make cancellation interrupt stalled or non-streaming HTTP reads instead of
+  waiting for the next stream chunk or request timeout,
 - move conversation ownership from the side panel to the native host,
 - split the native host into protocol, provider, agent, and tool modules.
 

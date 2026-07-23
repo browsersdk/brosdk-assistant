@@ -3,10 +3,10 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -74,6 +74,97 @@ struct McpHttpClient {
     http: Client,
     next_id: u64,
     session_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct StreamedToolCall {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct OpenAiStreamAccumulator {
+    content: String,
+    tool_calls: BTreeMap<usize, StreamedToolCall>,
+}
+
+impl OpenAiStreamAccumulator {
+    fn apply_chunk(&mut self, chunk: &Value) -> Result<Vec<String>, String> {
+        if let Some(error) = chunk.get("error") {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| error.to_string());
+            return Err(format!("model stream failed: {message}"));
+        }
+        let Some(delta) = chunk
+            .get("choices")
+            .and_then(Value::as_array)
+            .and_then(|choices| choices.first())
+            .and_then(|choice| choice.get("delta"))
+        else {
+            return Ok(Vec::new());
+        };
+
+        let mut content_deltas = Vec::new();
+        if let Some(content) = delta.get("content").and_then(Value::as_str)
+            && !content.is_empty()
+        {
+            self.content.push_str(content);
+            content_deltas.push(content.to_string());
+        }
+        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+            for (position, tool_call) in tool_calls.iter().enumerate() {
+                let index = tool_call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(position);
+                let entry = self.tool_calls.entry(index).or_default();
+                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                    entry.id = Some(id.to_string());
+                }
+                if let Some(function) = tool_call.get("function") {
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        entry.name.push_str(name);
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        entry.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        Ok(content_deltas)
+    }
+
+    fn into_message(self) -> Value {
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .map(|(index, tool_call)| {
+                json!({
+                    "id": tool_call.id.unwrap_or_else(|| format!("tool-call-{index}")),
+                    "type": "function",
+                    "function": {
+                        "name": tool_call.name,
+                        "arguments": tool_call.arguments,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let content = if self.content.is_empty() {
+            Value::Null
+        } else {
+            Value::String(self.content)
+        };
+        let mut message = json!({ "role": "assistant", "content": content });
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = Value::Array(tool_calls);
+        }
+        message
+    }
 }
 
 type RunRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
@@ -606,14 +697,26 @@ fn run_openai_agent(
         None
     };
     let mut tool_results = Vec::new();
+    let mut streamed_content = String::new();
 
     for _round in 0..MAX_OPENAI_TOOL_ROUNDS {
         ensure_run_active(run_context)?;
         if let Some(context) = run_context {
             context.emit("agent.status", json!({ "state": "model" }));
         }
-        let response =
-            call_openai_chat(&http, &endpoint, settings, &messages, &prepared.llm_tools)?;
+        let response = if let Some(context) = run_context {
+            call_openai_chat_stream(
+                &http,
+                &endpoint,
+                settings,
+                &messages,
+                &prepared.llm_tools,
+                context,
+                !streamed_content.is_empty(),
+            )?
+        } else {
+            call_openai_chat(&http, &endpoint, settings, &messages, &prepared.llm_tools)?
+        };
         ensure_run_active(run_context)?;
         let assistant_message = response
             .get("choices")
@@ -622,6 +725,15 @@ fn run_openai_agent(
             .and_then(|choice| choice.get("message"))
             .cloned()
             .ok_or_else(|| "model response did not contain a message".to_string())?;
+        if run_context.is_some()
+            && let Some(content) = assistant_message.get("content").and_then(Value::as_str)
+            && !content.is_empty()
+        {
+            if !streamed_content.is_empty() {
+                streamed_content.push_str("\n\n");
+            }
+            streamed_content.push_str(content);
+        }
 
         let tool_calls = assistant_message
             .get("tool_calls")
@@ -637,6 +749,13 @@ fn run_openai_agent(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let response_content = if run_context.is_some() && !streamed_content.is_empty() {
+                streamed_content.clone()
+            } else if content.is_empty() {
+                "Completed.".to_string()
+            } else {
+                content
+            };
             let mut debug_messages = messages.clone();
             debug_messages.push(assistant_message);
             let debug = agent_debug_info(
@@ -649,7 +768,7 @@ fn run_openai_agent(
             );
             return Ok(json!({
                 "accepted": true,
-                "message": if content.is_empty() { "Completed." } else { &content },
+                "message": response_content,
                 "llm_tool_count": prepared.llm_tools.len(),
                 "mcp_tool_count": prepared.mcp_tools.len(),
                 "extension_tool_count": prepared.extension_tools.len(),
@@ -772,9 +891,18 @@ fn run_openai_agent(
         &prepared,
     );
 
+    let stopped_message = if streamed_content.is_empty() {
+        format!(
+            "Stopped after {MAX_OPENAI_TOOL_ROUNDS} tool rounds. Please ask me to continue if more work is needed."
+        )
+    } else {
+        format!(
+            "{streamed_content}\n\nStopped after {MAX_OPENAI_TOOL_ROUNDS} tool rounds. Please ask me to continue if more work is needed."
+        )
+    };
     Ok(json!({
         "accepted": true,
-        "message": format!("Stopped after {MAX_OPENAI_TOOL_ROUNDS} tool rounds. Please ask me to continue if more work is needed."),
+        "message": stopped_message,
         "llm_tool_count": prepared.llm_tools.len(),
         "mcp_tool_count": prepared.mcp_tools.len(),
         "extension_tool_count": prepared.extension_tools.len(),
@@ -996,6 +1124,92 @@ fn call_openai_chat(
         return Err(format!("model request returned HTTP {status}: {text}"));
     }
     serde_json::from_str(&text).map_err(|error| format!("invalid model JSON response: {error}"))
+}
+
+fn call_openai_chat_stream(
+    http: &Client,
+    endpoint: &str,
+    settings: &Settings,
+    messages: &[Value],
+    tools: &[Value],
+    run_context: &RunContext,
+    prefix_before_content: bool,
+) -> Result<Value, String> {
+    let mut body = json!({
+        "model": settings.model_name,
+        "messages": messages,
+        "temperature": settings.temperature,
+        "stream": true,
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.to_vec());
+        body["tool_choice"] = json!("auto");
+    }
+
+    let response = http
+        .post(endpoint)
+        .bearer_auth(settings.api_key.trim())
+        .json(&body)
+        .send()
+        .map_err(|error| format!("model request failed: {error}"))?;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if !status.is_success() {
+        let text = response
+            .text()
+            .map_err(|error| format!("failed to read model error response: {error}"))?;
+        return Err(format!("model request returned HTTP {status}: {text}"));
+    }
+    if !content_type.contains("text/event-stream") {
+        let text = response
+            .text()
+            .map_err(|error| format!("failed to read model response: {error}"))?;
+        return serde_json::from_str(&text)
+            .map_err(|error| format!("invalid model JSON response: {error}"));
+    }
+
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    let mut accumulator = OpenAiStreamAccumulator::default();
+    let mut prefixed = false;
+    loop {
+        run_context.ensure_active()?;
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("failed to read model stream: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        let trimmed = line.trim();
+        let Some(data) = trimmed.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() {
+            continue;
+        }
+        if data == "[DONE]" {
+            break;
+        }
+        let chunk = serde_json::from_str::<Value>(data)
+            .map_err(|error| format!("invalid model stream JSON: {error}"))?;
+        for delta in accumulator.apply_chunk(&chunk)? {
+            if prefix_before_content && !prefixed {
+                run_context.emit("agent.delta", json!({ "delta": "\n\n" }));
+                prefixed = true;
+            }
+            run_context.emit("agent.delta", json!({ "delta": delta }));
+        }
+    }
+    Ok(json!({
+        "choices": [{ "message": accumulator.into_message() }]
+    }))
 }
 
 fn settings_json(settings: &Settings, configured: bool) -> Value {
@@ -2527,6 +2741,67 @@ mod tests {
         assert!(bridge.route_extension_response(&message));
         assert_eq!(receiver.recv().unwrap(), message);
         assert!(bridge.extension_waiters.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn openai_stream_accumulates_content_and_tool_call_fragments() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        let first_deltas = accumulator
+            .apply_chunk(&json!({
+                "choices": [{
+                    "delta": {
+                        "content": "Hello ",
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call-1",
+                            "function": {
+                                "name": "workspace_",
+                                "arguments": "{\"path\":\""
+                            }
+                        }]
+                    }
+                }]
+            }))
+            .unwrap();
+        let second_deltas = accumulator
+            .apply_chunk(&json!({
+                "choices": [{
+                    "delta": {
+                        "content": "world",
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": {
+                                "name": "read_file",
+                                "arguments": "notes.txt\"}"
+                            }
+                        }]
+                    }
+                }]
+            }))
+            .unwrap();
+
+        assert_eq!(first_deltas, vec!["Hello "]);
+        assert_eq!(second_deltas, vec!["world"]);
+        let message = accumulator.into_message();
+        assert_eq!(message["content"], "Hello world");
+        assert_eq!(message["tool_calls"][0]["id"], "call-1");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["name"],
+            "workspace_read_file"
+        );
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            "{\"path\":\"notes.txt\"}"
+        );
+    }
+
+    #[test]
+    fn openai_stream_surfaces_provider_errors() {
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        let error = accumulator
+            .apply_chunk(&json!({ "error": { "message": "rate limited" } }))
+            .expect_err("stream error should fail");
+        assert!(error.contains("rate limited"));
     }
 
     #[test]

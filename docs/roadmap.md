@@ -111,10 +111,10 @@ Exit criteria:
 
 Goal: make runs observable, cancellable, concurrent-safe, and testable.
 
-Status: in progress. The `run_id` protocol, concurrent request routing, tool
-events, cooperative cancellation, and DeepSeek E2E coverage are implemented.
-Provider streaming, in-flight HTTP interruption, host-owned conversations, and
-module extraction remain.
+Status: in progress. The `run_id` protocol, concurrent request routing, SSE
+`agent.delta` output, streamed tool-call reconstruction, tool events,
+cooperative cancellation, and DeepSeek E2E coverage are implemented. Complete
+HTTP interruption, host-owned conversations, and module extraction remain.
 
 - Add `run_id` based asynchronous agent protocol.
 - Stream model deltas and tool progress events.
