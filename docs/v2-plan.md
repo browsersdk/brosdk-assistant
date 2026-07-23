@@ -205,7 +205,8 @@ Implemented behavior:
 
 Remaining v0.2.0 work:
 
-- split the native host into protocol, provider, agent, and tool modules.
+- extract Native Messaging protocol, agent coordination, and tool ownership
+  from `main.rs`.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
 debug traces, page data, and tool results must be chunked or fetched separately
@@ -259,7 +260,7 @@ Provider adapters should eventually share these operations:
 
 ## Target Native-host Modules
 
-The current single-file host should be split along ownership boundaries:
+The native host is being split along ownership boundaries:
 
 ```text
 src/
@@ -281,8 +282,16 @@ src/
     workspace.rs
 ```
 
-The split should happen while implementing the asynchronous run protocol, not
-as an unrelated rewrite.
+Current progress:
+
+- `providers/openai.rs` owns OpenAI-compatible endpoint construction, blocking
+  compatibility requests, cancellable streaming requests, SSE decoding, and
+  provider-specific tests.
+- `main.rs` owns run coordination and translates provider deltas into native
+  events.
+
+Continue the split in small verified steps, preserving protocol behavior after
+each extracted module.
 
 ## Verification Strategy
 

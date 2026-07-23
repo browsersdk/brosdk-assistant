@@ -1,12 +1,14 @@
+mod providers;
+
+use providers::openai::OpenAiProvider;
 use reqwest::blocking::Client;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::future::Future;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
@@ -25,9 +27,7 @@ const MAX_OPENAI_TOOL_ROUNDS: usize = 6;
 const MAX_HISTORY_MESSAGES: usize = 24;
 const MAX_HISTORY_BYTES: usize = 64 * 1024;
 const MAX_CONVERSATIONS: usize = 50;
-const MAX_MODEL_STREAM_LINE_BYTES: usize = 1024 * 1024;
 const MAX_USER_MESSAGE_BYTES: usize = 64 * 1024;
-const MODEL_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTENSION_TOOL_TIMEOUT: Duration = Duration::from_secs(90);
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_EXTENSION_TOOL_ID: AtomicU64 = AtomicU64::new(1);
@@ -80,136 +80,6 @@ struct McpHttpClient {
     http: Client,
     next_id: u64,
     session_id: Option<String>,
-}
-
-#[derive(Debug, Default)]
-struct StreamedToolCall {
-    id: Option<String>,
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Default)]
-struct OpenAiStreamAccumulator {
-    content: String,
-    tool_calls: BTreeMap<usize, StreamedToolCall>,
-}
-
-#[derive(Debug, Default)]
-struct SseLineDecoder {
-    buffer: Vec<u8>,
-}
-
-impl SseLineDecoder {
-    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
-        self.buffer.extend_from_slice(chunk);
-        let mut lines = Vec::new();
-        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            if newline > MAX_MODEL_STREAM_LINE_BYTES {
-                return Err("model stream line exceeded the size limit".to_string());
-            }
-            let mut line = self.buffer.drain(..=newline).collect::<Vec<_>>();
-            while matches!(line.last(), Some(b'\n' | b'\r')) {
-                line.pop();
-            }
-            lines.push(
-                String::from_utf8(line)
-                    .map_err(|_| "model stream contained invalid UTF-8".to_string())?,
-            );
-        }
-        if self.buffer.len() > MAX_MODEL_STREAM_LINE_BYTES {
-            return Err("model stream line exceeded the size limit".to_string());
-        }
-        Ok(lines)
-    }
-
-    fn finish(&mut self) -> Result<Vec<String>, String> {
-        if self.buffer.is_empty() {
-            return Ok(Vec::new());
-        }
-        let line = std::mem::take(&mut self.buffer);
-        Ok(vec![String::from_utf8(line).map_err(|_| {
-            "model stream contained invalid UTF-8".to_string()
-        })?])
-    }
-}
-
-impl OpenAiStreamAccumulator {
-    fn apply_chunk(&mut self, chunk: &Value) -> Result<Vec<String>, String> {
-        if let Some(error) = chunk.get("error") {
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| error.to_string());
-            return Err(format!("model stream failed: {message}"));
-        }
-        let Some(delta) = chunk
-            .get("choices")
-            .and_then(Value::as_array)
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("delta"))
-        else {
-            return Ok(Vec::new());
-        };
-
-        let mut content_deltas = Vec::new();
-        if let Some(content) = delta.get("content").and_then(Value::as_str)
-            && !content.is_empty()
-        {
-            self.content.push_str(content);
-            content_deltas.push(content.to_string());
-        }
-        if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-            for (position, tool_call) in tool_calls.iter().enumerate() {
-                let index = tool_call
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as usize)
-                    .unwrap_or(position);
-                let entry = self.tool_calls.entry(index).or_default();
-                if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
-                    entry.id = Some(id.to_string());
-                }
-                if let Some(function) = tool_call.get("function") {
-                    if let Some(name) = function.get("name").and_then(Value::as_str) {
-                        entry.name.push_str(name);
-                    }
-                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                        entry.arguments.push_str(arguments);
-                    }
-                }
-            }
-        }
-        Ok(content_deltas)
-    }
-
-    fn into_message(self) -> Value {
-        let tool_calls = self
-            .tool_calls
-            .into_iter()
-            .map(|(index, tool_call)| {
-                json!({
-                    "id": tool_call.id.unwrap_or_else(|| format!("tool-call-{index}")),
-                    "type": "function",
-                    "function": {
-                        "name": tool_call.name,
-                        "arguments": tool_call.arguments,
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        let content = if self.content.is_empty() {
-            Value::Null
-        } else {
-            Value::String(self.content)
-        };
-        let mut message = json!({ "role": "assistant", "content": content });
-        if !tool_calls.is_empty() {
-            message["tool_calls"] = Value::Array(tool_calls);
-        }
-        message
-    }
 }
 
 type RunRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
@@ -976,27 +846,13 @@ fn run_openai_agent(
         attached_tabs_context,
         history,
     } = input;
-    let blocking_http = if run_context.is_none() {
-        Some(
-            Client::builder()
-                .timeout(Duration::from_secs(180))
-                .build()
-                .map_err(|error| format!("failed to create model HTTP client: {error}"))?,
-        )
-    } else {
-        None
-    };
-    let streaming_http = if run_context.is_some() {
-        Some(
-            reqwest::Client::builder()
-                .timeout(Duration::from_secs(180))
-                .build()
-                .map_err(|error| format!("failed to create model HTTP client: {error}"))?,
-        )
-    } else {
-        None
-    };
-    let endpoint = openai_chat_completions_url(&settings.model_base_url)?;
+    let provider = OpenAiProvider::new(
+        &settings.model_base_url,
+        &settings.model_name,
+        &settings.api_key,
+        settings.temperature,
+        run_context.is_some(),
+    )?;
     let mut messages = initial_agent_messages(prompt, history, message);
 
     let browser_tools_mode = normalize_browser_tools_mode(&settings.browser_tools_mode);
@@ -1016,27 +872,22 @@ fn run_openai_agent(
             context.emit("agent.status", json!({ "state": "model" }));
         }
         let response = if let Some(context) = run_context {
-            call_openai_chat_stream(
-                streaming_http
-                    .as_ref()
-                    .ok_or_else(|| "streaming model client is unavailable".to_string())?,
-                &endpoint,
-                settings,
+            let prefix_before_content = !streamed_content.is_empty();
+            let mut prefixed = false;
+            provider.chat_stream(
                 &messages,
                 &prepared.llm_tools,
-                context,
-                !streamed_content.is_empty(),
+                context.cancelled.as_ref(),
+                |delta| {
+                    if prefix_before_content && !prefixed {
+                        context.emit("agent.delta", json!({ "delta": "\n\n" }));
+                        prefixed = true;
+                    }
+                    context.emit("agent.delta", json!({ "delta": delta }));
+                },
             )?
         } else {
-            call_openai_chat(
-                blocking_http
-                    .as_ref()
-                    .ok_or_else(|| "blocking model client is unavailable".to_string())?,
-                &endpoint,
-                settings,
-                &messages,
-                &prepared.llm_tools,
-            )?
+            provider.chat(&messages, &prepared.llm_tools)?
         };
         ensure_run_active(run_context)?;
         let assistant_message = response
@@ -1401,223 +1252,6 @@ fn attached_tabs_context(params: &Value) -> Option<String> {
         ));
     }
     Some(lines.join("\n"))
-}
-
-fn openai_chat_completions_url(base_url: &str) -> Result<String, String> {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err("model_base_url is required".to_string());
-    }
-    if trimmed.ends_with("/chat/completions") {
-        return Ok(trimmed.to_string());
-    }
-    Ok(format!("{trimmed}/chat/completions"))
-}
-
-fn call_openai_chat(
-    http: &Client,
-    endpoint: &str,
-    settings: &Settings,
-    messages: &[Value],
-    tools: &[Value],
-) -> Result<Value, String> {
-    let mut body = json!({
-        "model": settings.model_name,
-        "messages": messages,
-        "temperature": settings.temperature,
-    });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-        body["tool_choice"] = json!("auto");
-    }
-
-    let response = http
-        .post(endpoint)
-        .bearer_auth(settings.api_key.trim())
-        .json(&body)
-        .send()
-        .map_err(|error| format!("model request failed: {error}"))?;
-    let status = response.status();
-    let text = response
-        .text()
-        .map_err(|error| format!("failed to read model response: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("model request returned HTTP {status}: {text}"));
-    }
-    serde_json::from_str(&text).map_err(|error| format!("invalid model JSON response: {error}"))
-}
-
-fn call_openai_chat_stream(
-    http: &reqwest::Client,
-    endpoint: &str,
-    settings: &Settings,
-    messages: &[Value],
-    tools: &[Value],
-    run_context: &RunContext,
-    prefix_before_content: bool,
-) -> Result<Value, String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| format!("failed to create model HTTP runtime: {error}"))?;
-    runtime.block_on(call_openai_chat_stream_async(
-        http,
-        endpoint,
-        settings,
-        messages,
-        tools,
-        run_context,
-        prefix_before_content,
-    ))
-}
-
-async fn call_openai_chat_stream_async(
-    http: &reqwest::Client,
-    endpoint: &str,
-    settings: &Settings,
-    messages: &[Value],
-    tools: &[Value],
-    run_context: &RunContext,
-    prefix_before_content: bool,
-) -> Result<Value, String> {
-    let mut body = json!({
-        "model": settings.model_name,
-        "messages": messages,
-        "temperature": settings.temperature,
-        "stream": true,
-    });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools.to_vec());
-        body["tool_choice"] = json!("auto");
-    }
-
-    let mut response = await_model_io(
-        http.post(endpoint)
-            .bearer_auth(settings.api_key.trim())
-            .json(&body)
-            .send(),
-        run_context,
-        "model request failed",
-    )
-    .await?;
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    if !status.is_success() {
-        let text = await_model_io(
-            response.text(),
-            run_context,
-            "failed to read model error response",
-        )
-        .await?;
-        return Err(format!("model request returned HTTP {status}: {text}"));
-    }
-    if !content_type.contains("text/event-stream") {
-        let text = await_model_io(
-            response.text(),
-            run_context,
-            "failed to read model response",
-        )
-        .await?;
-        return serde_json::from_str(&text)
-            .map_err(|error| format!("invalid model JSON response: {error}"));
-    }
-
-    let mut decoder = SseLineDecoder::default();
-    let mut accumulator = OpenAiStreamAccumulator::default();
-    let mut prefixed = false;
-    let mut done = false;
-    while !done {
-        let Some(chunk) =
-            await_model_io(response.chunk(), run_context, "failed to read model stream").await?
-        else {
-            break;
-        };
-        for line in decoder.push(&chunk)? {
-            if apply_openai_sse_line(
-                &line,
-                &mut accumulator,
-                run_context,
-                prefix_before_content,
-                &mut prefixed,
-            )? {
-                done = true;
-                break;
-            }
-        }
-    }
-    if !done {
-        for line in decoder.finish()? {
-            if apply_openai_sse_line(
-                &line,
-                &mut accumulator,
-                run_context,
-                prefix_before_content,
-                &mut prefixed,
-            )? {
-                break;
-            }
-        }
-    }
-    Ok(json!({
-        "choices": [{ "message": accumulator.into_message() }]
-    }))
-}
-
-async fn await_model_io<T, F>(
-    future: F,
-    run_context: &RunContext,
-    operation: &str,
-) -> Result<T, String>
-where
-    F: Future<Output = reqwest::Result<T>>,
-{
-    tokio::pin!(future);
-    let mut cancellation = tokio::time::interval(MODEL_CANCEL_POLL_INTERVAL);
-    cancellation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancellation.tick() => run_context.ensure_active()?,
-            result = &mut future => {
-                return result.map_err(|error| format!("{operation}: {error}"));
-            }
-        }
-    }
-}
-
-fn apply_openai_sse_line(
-    line: &str,
-    accumulator: &mut OpenAiStreamAccumulator,
-    run_context: &RunContext,
-    prefix_before_content: bool,
-    prefixed: &mut bool,
-) -> Result<bool, String> {
-    let trimmed = line.trim();
-    let Some(data) = trimmed.strip_prefix("data:") else {
-        return Ok(false);
-    };
-    let data = data.trim();
-    if data.is_empty() {
-        return Ok(false);
-    }
-    if data == "[DONE]" {
-        return Ok(true);
-    }
-    let chunk = serde_json::from_str::<Value>(data)
-        .map_err(|error| format!("invalid model stream JSON: {error}"))?;
-    for delta in accumulator.apply_chunk(&chunk)? {
-        if prefix_before_content && !*prefixed {
-            run_context.emit("agent.delta", json!({ "delta": "\n\n" }));
-            *prefixed = true;
-        }
-        run_context.emit("agent.delta", json!({ "delta": delta }));
-    }
-    Ok(false)
 }
 
 fn settings_json(settings: &Settings, configured: bool) -> Value {
@@ -3123,7 +2757,6 @@ fn write_message(value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
 
     fn test_bridge() -> (HostBridge, mpsc::Receiver<Value>) {
         let (outbound, output) = mpsc::channel();
@@ -3150,173 +2783,6 @@ mod tests {
         assert!(bridge.route_extension_response(&message));
         assert_eq!(receiver.recv().unwrap(), message);
         assert!(bridge.extension_waiters.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn openai_stream_accumulates_content_and_tool_call_fragments() {
-        let mut accumulator = OpenAiStreamAccumulator::default();
-        let first_deltas = accumulator
-            .apply_chunk(&json!({
-                "choices": [{
-                    "delta": {
-                        "content": "Hello ",
-                        "tool_calls": [{
-                            "index": 0,
-                            "id": "call-1",
-                            "function": {
-                                "name": "workspace_",
-                                "arguments": "{\"path\":\""
-                            }
-                        }]
-                    }
-                }]
-            }))
-            .unwrap();
-        let second_deltas = accumulator
-            .apply_chunk(&json!({
-                "choices": [{
-                    "delta": {
-                        "content": "world",
-                        "tool_calls": [{
-                            "index": 0,
-                            "function": {
-                                "name": "read_file",
-                                "arguments": "notes.txt\"}"
-                            }
-                        }]
-                    }
-                }]
-            }))
-            .unwrap();
-
-        assert_eq!(first_deltas, vec!["Hello "]);
-        assert_eq!(second_deltas, vec!["world"]);
-        let message = accumulator.into_message();
-        assert_eq!(message["content"], "Hello world");
-        assert_eq!(message["tool_calls"][0]["id"], "call-1");
-        assert_eq!(
-            message["tool_calls"][0]["function"]["name"],
-            "workspace_read_file"
-        );
-        assert_eq!(
-            message["tool_calls"][0]["function"]["arguments"],
-            "{\"path\":\"notes.txt\"}"
-        );
-    }
-
-    #[test]
-    fn openai_sse_decoder_handles_arbitrary_chunk_boundaries() {
-        let (bridge, output) = test_bridge();
-        let context = RunContext {
-            run_id: "run-stream-test".to_string(),
-            conversation_id: "conversation-stream-test".to_string(),
-            client_id: None,
-            cancelled: Arc::new(AtomicBool::new(false)),
-            bridge,
-        };
-        let mut decoder = SseLineDecoder::default();
-        let mut accumulator = OpenAiStreamAccumulator::default();
-        let mut prefixed = false;
-        let mut done = false;
-
-        assert!(
-            decoder
-                .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hel")
-                .unwrap()
-                .is_empty()
-        );
-        for line in decoder.push(b"lo\"}}]}\r\n\r\ndata: [DO").unwrap() {
-            done |= apply_openai_sse_line(&line, &mut accumulator, &context, false, &mut prefixed)
-                .unwrap();
-        }
-        for line in decoder.push(b"NE]\n").unwrap() {
-            done |= apply_openai_sse_line(&line, &mut accumulator, &context, false, &mut prefixed)
-                .unwrap();
-        }
-
-        assert!(done);
-        assert!(decoder.finish().unwrap().is_empty());
-        assert_eq!(accumulator.into_message()["content"], "hello");
-        let event = output.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(event["event"], "agent.delta");
-        assert_eq!(event["payload"]["delta"], "hello");
-    }
-
-    #[test]
-    fn model_stream_cancellation_interrupts_a_stalled_http_read() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let (ready_sender, ready_receiver) = mpsc::channel();
-        let (release_sender, release_receiver) = mpsc::channel();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 4096];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-            stream.flush().unwrap();
-            ready_sender.send(()).unwrap();
-            let _ = release_receiver.recv_timeout(Duration::from_secs(5));
-        });
-
-        let (bridge, _output) = test_bridge();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let context = RunContext {
-            run_id: "run-cancel-http-test".to_string(),
-            conversation_id: "conversation-cancel-http-test".to_string(),
-            client_id: None,
-            cancelled: cancelled.clone(),
-            bridge,
-        };
-        let endpoint = format!("http://{address}/chat/completions");
-        let settings = Settings {
-            model_name: "test-model".to_string(),
-            api_key: "test-key".to_string(),
-            ..Settings::default()
-        };
-        let (result_sender, result_receiver) = mpsc::channel();
-        thread::spawn(move || {
-            let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(5))
-                .build()
-                .unwrap();
-            let result = call_openai_chat_stream(
-                &http,
-                &endpoint,
-                &settings,
-                &[json!({ "role": "user", "content": "hello" })],
-                &[],
-                &context,
-                false,
-            );
-            result_sender.send(result).unwrap();
-        });
-
-        ready_receiver
-            .recv_timeout(Duration::from_secs(2))
-            .expect("model request did not reach the stalled response body");
-        let cancelled_at = Instant::now();
-        cancelled.store(true, Ordering::SeqCst);
-        let result = result_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("cancelled model request did not stop promptly");
-        assert_eq!(result.unwrap_err(), "run cancelled");
-        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
-
-        release_sender.send(()).unwrap();
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn openai_stream_surfaces_provider_errors() {
-        let mut accumulator = OpenAiStreamAccumulator::default();
-        let error = accumulator
-            .apply_chunk(&json!({ "error": { "message": "rate limited" } }))
-            .expect_err("stream error should fail");
-        assert!(error.contains("rate limited"));
     }
 
     #[test]
