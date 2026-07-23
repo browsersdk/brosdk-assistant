@@ -111,6 +111,15 @@ The Rust host can be tested without Chrome by sending length-prefixed JSON to
 stdin. The extension background uses the same framing through
 `chrome.runtime.connectNative("com.browsersdk.assistant")`.
 
+The deterministic protocol E2E starts a local mock OpenAI server and verifies
+concurrent Native Messaging requests, streamed model output, extension browser
+tool correlation, and the final two-round agent response without external API
+credentials:
+
+```powershell
+python scripts\test_native_protocol_e2e.py
+```
+
 ## DeepSeek End-to-End Test
 
 The real-provider E2E test starts the native host with a temporary settings
@@ -142,7 +151,7 @@ Optional environment variables:
 The Anthropic-compatible DeepSeek endpoint is not tested until the native host
 has an Anthropic Messages API adapter.
 
-Validated on 2026-07-23 with:
+Validated on 2026-07-24 with:
 
 - `deepseek-v4-flash`
 - `deepseek-v4-pro`

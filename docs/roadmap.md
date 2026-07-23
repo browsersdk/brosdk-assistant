@@ -76,11 +76,10 @@ Available today:
 Known gaps:
 
 - host-owned conversation state is memory-only and not searchable or persisted,
-- most native tool code remains concentrated in `main.rs`,
 - Anthropic is not implemented,
 - extension element refs are not stable across page changes,
 - destructive actions have no confirmation layer,
-- extension and protocol integration tests are missing,
+- Chrome extension smoke coverage is still missing,
 - installation is still a developer-oriented workflow.
 
 ## Milestones
@@ -117,8 +116,9 @@ event routing, cancellable model HTTP I/O, and DeepSeek E2E coverage are
 implemented. The OpenAI provider, Native Messaging protocol, and agent run
 coordination, scoped workspace tools, and generic MCP transport have been
 extracted from `main.rs`. MCP initialization, discovery, invocation, session,
-SSE, and error paths now have local HTTP integration coverage. Broader native
-and Chrome integration tests remain the release gate.
+SSE, and error paths now have local HTTP integration coverage. A deterministic
+native protocol E2E covers concurrent routing, streaming, and extension-tool
+correlation. Chrome integration tests remain the release gate.
 
 - Add `run_id` based asynchronous agent protocol.
 - Stream model deltas and tool progress events.

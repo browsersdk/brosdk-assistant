@@ -205,7 +205,7 @@ Implemented behavior:
 
 Remaining v0.2.0 work:
 
-- add broader native protocol and Chrome integration tests.
+- add a Chrome extension smoke test using a controlled local page.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
 debug traces, page data, and tool results must be chunked or fetched separately
@@ -300,6 +300,9 @@ Current progress:
 - `main.rs` owns the model/tool execution loop, MCP policy and provider mapping,
   extension-tool orchestration, and translates provider deltas into native
   events.
+- `scripts/test_native_protocol_e2e.py` drives the compiled host through Native
+  Messaging with a local mock model, including concurrent health routing,
+  streamed deltas, extension tool correlation, and a two-round agent response.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not
@@ -318,6 +321,9 @@ cd ..\native-host
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+
+cd ..
+python scripts\test_native_protocol_e2e.py
 ```
 
 When a DeepSeek test key is available, run the real-provider E2E without

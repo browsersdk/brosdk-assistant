@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,9 +54,16 @@ def redact(value: str, secret: str) -> str:
 
 
 class NativeHost:
-    def __init__(self, executable: Path, environment: dict[str, str], secret: str):
+    def __init__(
+        self,
+        executable: Path,
+        environment: dict[str, str],
+        secret: str,
+        extension_tool_handler: Callable[[dict[str, Any]], Any] | None = None,
+    ):
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         self.secret = secret
+        self.extension_tool_handler = extension_tool_handler
         self.process = subprocess.Popen(
             [str(executable)],
             stdin=subprocess.PIPE,
@@ -148,8 +155,8 @@ class NativeHost:
                 if remaining <= 0:
                     raise TimeoutError(f"timed out waiting for {method}")
                 message = self.receive(remaining)
-                if message.get("event") == "extension.tool.request":
-                    raise RuntimeError("unexpected extension tool request while browser tools are off")
+                if self.handle_extension_tool_request(message):
+                    continue
                 if message.get("id") != request_id:
                     deferred.append(message)
                     continue
@@ -171,6 +178,10 @@ class NativeHost:
                     raise TimeoutError(f"timed out waiting for run {run_id}")
                 message = self.receive(remaining)
                 payload = message.get("payload") or {}
+                if self.handle_extension_tool_request(message):
+                    if payload.get("run_id") == run_id:
+                        events.append(message)
+                    continue
                 if payload.get("run_id") != run_id:
                     deferred.append(message)
                     continue
@@ -185,6 +196,28 @@ class NativeHost:
                     raise RuntimeError(f"agent run failed: {error.get('message', error)}")
         finally:
             self.deferred_messages = deferred + self.deferred_messages
+
+    def handle_extension_tool_request(self, message: dict[str, Any]) -> bool:
+        if message.get("event") != "extension.tool.request":
+            return False
+        if self.extension_tool_handler is None:
+            raise RuntimeError("unexpected extension tool request while browser tools are off")
+        payload = message.get("payload") or {}
+        request_id = payload.get("id")
+        if not request_id:
+            raise RuntimeError("extension tool request did not contain an id")
+        try:
+            result = self.extension_tool_handler(payload)
+            self.send({"id": request_id, "result": result})
+        except Exception as error:
+            self.send(
+                {
+                    "id": request_id,
+                    "error": {"code": "extension_tool_failed", "message": str(error)},
+                }
+            )
+            raise
+        return True
 
     def close(self) -> None:
         if self.process.stdin:
