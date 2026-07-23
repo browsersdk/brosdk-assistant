@@ -75,9 +75,8 @@ Available today:
 
 Known gaps:
 
-- synchronous runs block request routing,
-- cancellation and streaming are not implemented,
-- conversation state is not host-owned or persisted,
+- host-owned conversation state is memory-only and not searchable or persisted,
+- the native host remains concentrated in a single large module,
 - Anthropic is not implemented,
 - extension element refs are not stable across page changes,
 - destructive actions have no confirmation layer,
@@ -90,7 +89,7 @@ Known gaps:
 
 Goal: remove misleading defaults and make the existing path dependable.
 
-Status: implemented in the working tree; pending commit and release packaging.
+Status: completed.
 
 - Default new installations to Chrome Extension browser tools.
 - Keep Anthropic visible only as unavailable until its adapter works.
@@ -113,8 +112,9 @@ Goal: make runs observable, cancellable, concurrent-safe, and testable.
 
 Status: in progress. The `run_id` protocol, concurrent request routing, SSE
 `agent.delta` output, streamed tool-call reconstruction, tool events,
-cooperative cancellation, and DeepSeek E2E coverage are implemented. Complete
-HTTP interruption, host-owned conversations, and module extraction remain.
+cooperative cancellation, host-owned bounded conversations, per-side-panel
+event routing, cancellable model HTTP I/O, and DeepSeek E2E coverage are
+implemented. Native module extraction and broader integration tests remain.
 
 - Add `run_id` based asynchronous agent protocol.
 - Stream model deltas and tool progress events.

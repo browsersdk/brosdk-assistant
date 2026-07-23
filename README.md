@@ -115,14 +115,18 @@ stdin. The extension background uses the same framing through
 
 The real-provider E2E test starts the native host with a temporary settings
 directory and verifies Native Messaging, settings persistence, an OpenAI-
-compatible model request, a scoped workspace tool call, and multi-turn context.
-The API key is read only from the environment and is not written to the
-repository.
+compatible model request, a scoped workspace tool call, and host-owned
+multi-turn context. The API key is read only from the environment and is not
+written to the repository.
 
 The test also verifies the asynchronous `agent.start` protocol, concurrent
 `agent.health` routing during a model run, streamed `agent.delta` output,
 streamed tool-call reconstruction, tool progress events, and `agent.cancel`
-acknowledgement.
+acknowledgement. It also checks `conversation.get` and `conversation.reset`
+without sending prior messages from the client.
+
+The native test suite separately holds an SSE response body open without data
+and verifies that `agent.cancel` interrupts the pending model read promptly.
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "<temporary-api-key>"

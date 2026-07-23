@@ -262,11 +262,13 @@ def run_test(args: argparse.Namespace, api_key: str) -> None:
             )
             first_start = host.request(
                 "agent.start",
-                {"message": first_prompt, "history": [], "mode": "chat"},
+                {"message": first_prompt, "mode": "chat"},
                 args.timeout,
             )
             first_run_id = str(first_start.get("run_id", ""))
             require(first_run_id, "agent.start did not return a run id")
+            conversation_id = str(first_start.get("conversation_id", ""))
+            require(conversation_id, "agent.start did not return a conversation id")
             health_started = time.monotonic()
             concurrent_health = host.request("agent.health", None, args.timeout)
             health_latency = time.monotonic() - health_started
@@ -311,10 +313,7 @@ def run_test(args: argparse.Namespace, api_key: str) -> None:
                 "agent.start",
                 {
                     "message": second_prompt,
-                    "history": [
-                        {"role": "user", "content": first_prompt},
-                        {"role": "assistant", "content": first_answer},
-                    ],
+                    "conversation_id": conversation_id,
                     "mode": "chat",
                 },
                 args.timeout,
@@ -326,15 +325,40 @@ def run_test(args: argparse.Namespace, api_key: str) -> None:
             second_answer = str(second.get("message", ""))
             require(
                 verification_token.lower() in second_answer.lower(),
-                "second response did not preserve multi-turn context",
+                "host-owned conversation did not preserve multi-turn context",
             )
-            print(f"PASS agent.start multi_turn token={verification_token}")
+            conversation = host.request(
+                "conversation.get",
+                {"conversation_id": conversation_id},
+                args.timeout,
+            )
+            require(
+                conversation.get("message_count") == 4,
+                "conversation did not persist two turns",
+            )
+            print(f"PASS agent.start host_conversation token={verification_token}")
+
+            cleared = host.request(
+                "conversation.reset",
+                {"conversation_id": conversation_id},
+                args.timeout,
+            )
+            require(
+                cleared.get("cleared") is True,
+                "conversation.reset did not clear the conversation",
+            )
+            conversation = host.request(
+                "conversation.get",
+                {"conversation_id": conversation_id},
+                args.timeout,
+            )
+            require(conversation.get("message_count") == 0, "conversation remained after reset")
+            print("PASS conversation.reset")
 
             cancel_start = host.request(
                 "agent.start",
                 {
                     "message": "Write a detailed 2000-word explanation of browser automation.",
-                    "history": [],
                     "mode": "chat",
                 },
                 args.timeout,

@@ -6,7 +6,8 @@ use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::future::Future;
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,10 +24,15 @@ const OPENAI_TOOL_NAME_MAX_LENGTH: usize = 64;
 const MAX_OPENAI_TOOL_ROUNDS: usize = 6;
 const MAX_HISTORY_MESSAGES: usize = 24;
 const MAX_HISTORY_BYTES: usize = 64 * 1024;
+const MAX_CONVERSATIONS: usize = 50;
+const MAX_MODEL_STREAM_LINE_BYTES: usize = 1024 * 1024;
 const MAX_USER_MESSAGE_BYTES: usize = 64 * 1024;
+const MODEL_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTENSION_TOOL_TIMEOUT: Duration = Duration::from_secs(90);
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_EXTENSION_TOOL_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CONVERSATION_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CONVERSATION_UPDATE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Deserialize)]
 struct Request {
@@ -87,6 +93,45 @@ struct StreamedToolCall {
 struct OpenAiStreamAccumulator {
     content: String,
     tool_calls: BTreeMap<usize, StreamedToolCall>,
+}
+
+#[derive(Debug, Default)]
+struct SseLineDecoder {
+    buffer: Vec<u8>,
+}
+
+impl SseLineDecoder {
+    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, String> {
+        self.buffer.extend_from_slice(chunk);
+        let mut lines = Vec::new();
+        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            if newline > MAX_MODEL_STREAM_LINE_BYTES {
+                return Err("model stream line exceeded the size limit".to_string());
+            }
+            let mut line = self.buffer.drain(..=newline).collect::<Vec<_>>();
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            lines.push(
+                String::from_utf8(line)
+                    .map_err(|_| "model stream contained invalid UTF-8".to_string())?,
+            );
+        }
+        if self.buffer.len() > MAX_MODEL_STREAM_LINE_BYTES {
+            return Err("model stream line exceeded the size limit".to_string());
+        }
+        Ok(lines)
+    }
+
+    fn finish(&mut self) -> Result<Vec<String>, String> {
+        if self.buffer.is_empty() {
+            return Ok(Vec::new());
+        }
+        let line = std::mem::take(&mut self.buffer);
+        Ok(vec![String::from_utf8(line).map_err(|_| {
+            "model stream contained invalid UTF-8".to_string()
+        })?])
+    }
 }
 
 impl OpenAiStreamAccumulator {
@@ -168,6 +213,13 @@ impl OpenAiStreamAccumulator {
 }
 
 type RunRegistry = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
+type ConversationRegistry = Arc<Mutex<HashMap<String, Conversation>>>;
+
+#[derive(Debug, Default)]
+struct Conversation {
+    messages: Vec<Value>,
+    updated_at: u64,
+}
 
 #[derive(Clone)]
 struct HostBridge {
@@ -212,6 +264,8 @@ impl HostBridge {
 #[derive(Clone)]
 struct RunContext {
     run_id: String,
+    conversation_id: String,
+    client_id: Option<String>,
     cancelled: Arc<AtomicBool>,
     bridge: HostBridge,
 }
@@ -233,8 +287,17 @@ impl RunContext {
         if !self.is_cancelled() {
             if let Value::Object(fields) = &mut payload {
                 fields.insert("run_id".to_string(), json!(self.run_id));
+                fields.insert("conversation_id".to_string(), json!(self.conversation_id));
+                if let Some(client_id) = &self.client_id {
+                    fields.insert("client_id".to_string(), json!(client_id));
+                }
             } else {
-                payload = json!({ "run_id": self.run_id, "data": payload });
+                payload = json!({
+                    "run_id": self.run_id,
+                    "conversation_id": self.conversation_id,
+                    "client_id": self.client_id,
+                    "data": payload,
+                });
             }
             let _ = self.bridge.send_event(event, payload);
         }
@@ -274,6 +337,7 @@ fn main() {
         extension_waiters: Arc::new(Mutex::new(HashMap::new())),
     };
     let runs: RunRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let conversations: ConversationRegistry = Arc::new(Mutex::new(HashMap::new()));
     let ready = json!({
         "event": "native.ready",
         "payload": {
@@ -311,13 +375,19 @@ fn main() {
 
         match request.method.as_str() {
             "agent.start" => {
-                start_agent_run(request, &settings, &bridge, &runs);
+                start_agent_run(request, &settings, &bridge, &runs, &conversations);
             }
             "agent.cancel" => {
                 cancel_agent_run(request, &bridge, &runs);
             }
             "agent.reset" => {
                 reset_agent_runs(request, &bridge, &runs);
+            }
+            "conversation.get" => {
+                get_conversation(request, &bridge, &conversations);
+            }
+            "conversation.reset" => {
+                reset_conversation(request, &bridge, &conversations);
             }
             _ => {
                 let response =
@@ -331,7 +401,13 @@ fn main() {
     }
 }
 
-fn start_agent_run(request: Request, settings: &Settings, bridge: &HostBridge, runs: &RunRegistry) {
+fn start_agent_run(
+    request: Request,
+    settings: &Settings,
+    bridge: &HostBridge,
+    runs: &RunRegistry,
+    conversations: &ConversationRegistry,
+) {
     let run_id = format!(
         "run-{}-{}",
         process::id(),
@@ -339,7 +415,41 @@ fn start_agent_run(request: Request, settings: &Settings, bridge: &HostBridge, r
     );
     let effective_settings =
         settings_from_params(&request.params).unwrap_or_else(|| settings.clone());
-    let params = request.params;
+    let client_id = match resolve_client_id(&request.params) {
+        Ok(client_id) => client_id,
+        Err(error) => {
+            let _ = bridge.send_response(err(request.id, "invalid_client_id", &error));
+            return;
+        }
+    };
+    let conversation_id = match resolve_conversation_id(&request.params) {
+        Ok(conversation_id) => conversation_id,
+        Err(error) => {
+            let _ = bridge.send_response(err(request.id, "invalid_conversation_id", &error));
+            return;
+        }
+    };
+    let history = match conversation_messages(conversations, &conversation_id) {
+        Ok(history) => history,
+        Err(error) => {
+            let _ = bridge.send_response(err(request.id, "conversation_failed", &error));
+            return;
+        }
+    };
+    let mut params = request.params;
+    let Some(fields) = params.as_object_mut() else {
+        let _ = bridge.send_response(err(
+            request.id,
+            "invalid_params",
+            "agent.start params must be a JSON object",
+        ));
+        return;
+    };
+    fields.insert("history".to_string(), Value::Array(history));
+    let user_message = fields
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let cancelled = Arc::new(AtomicBool::new(false));
     if let Ok(mut active_runs) = runs.lock() {
         active_runs.insert(run_id.clone(), cancelled.clone());
@@ -354,7 +464,11 @@ fn start_agent_run(request: Request, settings: &Settings, bridge: &HostBridge, r
 
     if let Err(error) = bridge.send_response(ok(
         request.id,
-        json!({ "run_id": run_id, "state": "queued" }),
+        json!({
+            "run_id": run_id,
+            "conversation_id": conversation_id,
+            "state": "queued",
+        }),
     )) {
         eprintln!("[native] failed to queue agent.start response: {error}");
         if let Ok(mut active_runs) = runs.lock() {
@@ -365,10 +479,13 @@ fn start_agent_run(request: Request, settings: &Settings, bridge: &HostBridge, r
 
     let context = RunContext {
         run_id: run_id.clone(),
+        conversation_id: conversation_id.clone(),
+        client_id,
         cancelled,
         bridge: bridge.clone(),
     };
     let active_runs = runs.clone();
+    let conversation_registry = conversations.clone();
     thread::spawn(move || {
         if !context.is_cancelled() {
             context.emit("agent.status", json!({ "state": "running" }));
@@ -381,7 +498,34 @@ fn start_agent_run(request: Request, settings: &Settings, bridge: &HostBridge, r
         );
         if !context.is_cancelled() {
             match result {
-                Ok(result) => context.emit("agent.done", json!({ "result": result })),
+                Ok(result) => {
+                    let saved = user_message
+                        .as_deref()
+                        .zip(result.get("message").and_then(Value::as_str))
+                        .map(|(user, assistant)| {
+                            append_conversation_turn_if_active(
+                                &conversation_registry,
+                                &conversation_id,
+                                user,
+                                assistant,
+                                Some(context.cancelled.as_ref()),
+                            )
+                        })
+                        .transpose();
+                    match saved {
+                        Ok(Some(false)) => {}
+                        Ok(_) => context.emit("agent.done", json!({ "result": result })),
+                        Err(error) => context.emit(
+                            "agent.error",
+                            json!({
+                                "error": {
+                                    "code": "conversation_save_failed",
+                                    "message": error,
+                                }
+                            }),
+                        ),
+                    }
+                }
                 Err(error) => context.emit(
                     "agent.error",
                     json!({
@@ -397,6 +541,153 @@ fn start_agent_run(request: Request, settings: &Settings, bridge: &HostBridge, r
             runs.remove(&run_id);
         }
     });
+}
+
+fn resolve_conversation_id(params: &Value) -> Result<String, String> {
+    match params.get("conversation_id") {
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() || value.len() > 128 {
+                return Err("conversation_id must contain 1 to 128 characters".to_string());
+            }
+            if !value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            {
+                return Err("conversation_id contains unsupported characters".to_string());
+            }
+            return Ok(value.to_string());
+        }
+        Some(_) => return Err("conversation_id must be a string".to_string()),
+        None => {}
+    }
+    Ok(format!(
+        "conversation-{}-{}",
+        process::id(),
+        NEXT_CONVERSATION_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+fn resolve_client_id(params: &Value) -> Result<Option<String>, String> {
+    match params.get("client_id") {
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() || value.len() > 128 {
+                return Err("client_id must contain 1 to 128 characters".to_string());
+            }
+            Ok(Some(value.to_string()))
+        }
+        Some(_) => Err("client_id must be a string".to_string()),
+        None => Ok(None),
+    }
+}
+
+fn conversation_messages(
+    conversations: &ConversationRegistry,
+    conversation_id: &str,
+) -> Result<Vec<Value>, String> {
+    conversations
+        .lock()
+        .map_err(|_| "failed to access conversation registry".to_string())
+        .map(|registry| {
+            registry
+                .get(conversation_id)
+                .map(|conversation| conversation.messages.clone())
+                .unwrap_or_default()
+        })
+}
+
+fn append_conversation_turn_if_active(
+    conversations: &ConversationRegistry,
+    conversation_id: &str,
+    user: &str,
+    assistant: &str,
+    cancelled: Option<&AtomicBool>,
+) -> Result<bool, String> {
+    let mut registry = conversations
+        .lock()
+        .map_err(|_| "failed to access conversation registry".to_string())?;
+    if cancelled.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Ok(false);
+    }
+    if !registry.contains_key(conversation_id) && registry.len() >= MAX_CONVERSATIONS {
+        let oldest = registry
+            .iter()
+            .min_by_key(|(_, conversation)| conversation.updated_at)
+            .map(|(id, _)| id.clone());
+        if let Some(oldest) = oldest {
+            registry.remove(&oldest);
+        }
+    }
+    let conversation = registry.entry(conversation_id.to_string()).or_default();
+    conversation
+        .messages
+        .push(json!({ "role": "user", "content": user }));
+    conversation
+        .messages
+        .push(json!({ "role": "assistant", "content": assistant }));
+    conversation.updated_at = NEXT_CONVERSATION_UPDATE.fetch_add(1, Ordering::Relaxed);
+    while conversation.messages.len() > MAX_HISTORY_MESSAGES {
+        conversation.messages.drain(..2);
+    }
+    while serialized_size(&conversation.messages) > MAX_HISTORY_BYTES
+        && conversation.messages.len() >= 2
+    {
+        conversation.messages.drain(..2);
+    }
+    Ok(true)
+}
+
+fn get_conversation(request: Request, bridge: &HostBridge, conversations: &ConversationRegistry) {
+    let Some(conversation_id) = request
+        .params
+        .get("conversation_id")
+        .and_then(Value::as_str)
+    else {
+        let _ = bridge.send_response(err(
+            request.id,
+            "invalid_params",
+            "conversation_id is required",
+        ));
+        return;
+    };
+    match conversation_messages(conversations, conversation_id) {
+        Ok(messages) => {
+            let _ = bridge.send_response(ok(
+                request.id,
+                json!({
+                    "conversation_id": conversation_id,
+                    "message_count": messages.len(),
+                }),
+            ));
+        }
+        Err(error) => {
+            let _ = bridge.send_response(err(request.id, "conversation_failed", &error));
+        }
+    }
+}
+
+fn reset_conversation(request: Request, bridge: &HostBridge, conversations: &ConversationRegistry) {
+    let Some(conversation_id) = request
+        .params
+        .get("conversation_id")
+        .and_then(Value::as_str)
+    else {
+        let _ = bridge.send_response(err(
+            request.id,
+            "invalid_params",
+            "conversation_id is required",
+        ));
+        return;
+    };
+    let removed = conversations
+        .lock()
+        .map(|mut registry| registry.remove(conversation_id).is_some())
+        .unwrap_or(false);
+    let _ = bridge.send_response(ok(
+        request.id,
+        json!({ "conversation_id": conversation_id, "cleared": removed }),
+    ));
 }
 
 fn cancel_agent_run(request: Request, bridge: &HostBridge, runs: &RunRegistry) {
@@ -417,7 +708,11 @@ fn cancel_agent_run(request: Request, bridge: &HostBridge, runs: &RunRegistry) {
         request.id,
         json!({ "run_id": run_id, "state": "cancelled" }),
     ));
-    let _ = bridge.send_event("agent.cancelled", json!({ "run_id": run_id }));
+    let mut payload = json!({ "run_id": run_id });
+    if let Ok(Some(client_id)) = resolve_client_id(&request.params) {
+        payload["client_id"] = json!(client_id);
+    }
+    let _ = bridge.send_event("agent.cancelled", payload);
 }
 
 fn reset_agent_runs(request: Request, bridge: &HostBridge, runs: &RunRegistry) {
@@ -681,10 +976,26 @@ fn run_openai_agent(
         attached_tabs_context,
         history,
     } = input;
-    let http = Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(|error| format!("failed to create model HTTP client: {error}"))?;
+    let blocking_http = if run_context.is_none() {
+        Some(
+            Client::builder()
+                .timeout(Duration::from_secs(180))
+                .build()
+                .map_err(|error| format!("failed to create model HTTP client: {error}"))?,
+        )
+    } else {
+        None
+    };
+    let streaming_http = if run_context.is_some() {
+        Some(
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(180))
+                .build()
+                .map_err(|error| format!("failed to create model HTTP client: {error}"))?,
+        )
+    } else {
+        None
+    };
     let endpoint = openai_chat_completions_url(&settings.model_base_url)?;
     let mut messages = initial_agent_messages(prompt, history, message);
 
@@ -706,7 +1017,9 @@ fn run_openai_agent(
         }
         let response = if let Some(context) = run_context {
             call_openai_chat_stream(
-                &http,
+                streaming_http
+                    .as_ref()
+                    .ok_or_else(|| "streaming model client is unavailable".to_string())?,
                 &endpoint,
                 settings,
                 &messages,
@@ -715,7 +1028,15 @@ fn run_openai_agent(
                 !streamed_content.is_empty(),
             )?
         } else {
-            call_openai_chat(&http, &endpoint, settings, &messages, &prepared.llm_tools)?
+            call_openai_chat(
+                blocking_http
+                    .as_ref()
+                    .ok_or_else(|| "blocking model client is unavailable".to_string())?,
+                &endpoint,
+                settings,
+                &messages,
+                &prepared.llm_tools,
+            )?
         };
         ensure_run_active(run_context)?;
         let assistant_message = response
@@ -1127,7 +1448,31 @@ fn call_openai_chat(
 }
 
 fn call_openai_chat_stream(
-    http: &Client,
+    http: &reqwest::Client,
+    endpoint: &str,
+    settings: &Settings,
+    messages: &[Value],
+    tools: &[Value],
+    run_context: &RunContext,
+    prefix_before_content: bool,
+) -> Result<Value, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| format!("failed to create model HTTP runtime: {error}"))?;
+    runtime.block_on(call_openai_chat_stream_async(
+        http,
+        endpoint,
+        settings,
+        messages,
+        tools,
+        run_context,
+        prefix_before_content,
+    ))
+}
+
+async fn call_openai_chat_stream_async(
+    http: &reqwest::Client,
     endpoint: &str,
     settings: &Settings,
     messages: &[Value],
@@ -1146,12 +1491,15 @@ fn call_openai_chat_stream(
         body["tool_choice"] = json!("auto");
     }
 
-    let response = http
-        .post(endpoint)
-        .bearer_auth(settings.api_key.trim())
-        .json(&body)
-        .send()
-        .map_err(|error| format!("model request failed: {error}"))?;
+    let mut response = await_model_io(
+        http.post(endpoint)
+            .bearer_auth(settings.api_key.trim())
+            .json(&body)
+            .send(),
+        run_context,
+        "model request failed",
+    )
+    .await?;
     let status = response.status();
     let content_type = response
         .headers()
@@ -1160,56 +1508,116 @@ fn call_openai_chat_stream(
         .unwrap_or("")
         .to_string();
     if !status.is_success() {
-        let text = response
-            .text()
-            .map_err(|error| format!("failed to read model error response: {error}"))?;
+        let text = await_model_io(
+            response.text(),
+            run_context,
+            "failed to read model error response",
+        )
+        .await?;
         return Err(format!("model request returned HTTP {status}: {text}"));
     }
     if !content_type.contains("text/event-stream") {
-        let text = response
-            .text()
-            .map_err(|error| format!("failed to read model response: {error}"))?;
+        let text = await_model_io(
+            response.text(),
+            run_context,
+            "failed to read model response",
+        )
+        .await?;
         return serde_json::from_str(&text)
             .map_err(|error| format!("invalid model JSON response: {error}"));
     }
 
-    let mut reader = BufReader::new(response);
-    let mut line = String::new();
+    let mut decoder = SseLineDecoder::default();
     let mut accumulator = OpenAiStreamAccumulator::default();
     let mut prefixed = false;
-    loop {
-        run_context.ensure_active()?;
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("failed to read model stream: {error}"))?;
-        if read == 0 {
+    let mut done = false;
+    while !done {
+        let Some(chunk) =
+            await_model_io(response.chunk(), run_context, "failed to read model stream").await?
+        else {
             break;
-        }
-        let trimmed = line.trim();
-        let Some(data) = trimmed.strip_prefix("data:") else {
-            continue;
         };
-        let data = data.trim();
-        if data.is_empty() {
-            continue;
-        }
-        if data == "[DONE]" {
-            break;
-        }
-        let chunk = serde_json::from_str::<Value>(data)
-            .map_err(|error| format!("invalid model stream JSON: {error}"))?;
-        for delta in accumulator.apply_chunk(&chunk)? {
-            if prefix_before_content && !prefixed {
-                run_context.emit("agent.delta", json!({ "delta": "\n\n" }));
-                prefixed = true;
+        for line in decoder.push(&chunk)? {
+            if apply_openai_sse_line(
+                &line,
+                &mut accumulator,
+                run_context,
+                prefix_before_content,
+                &mut prefixed,
+            )? {
+                done = true;
+                break;
             }
-            run_context.emit("agent.delta", json!({ "delta": delta }));
+        }
+    }
+    if !done {
+        for line in decoder.finish()? {
+            if apply_openai_sse_line(
+                &line,
+                &mut accumulator,
+                run_context,
+                prefix_before_content,
+                &mut prefixed,
+            )? {
+                break;
+            }
         }
     }
     Ok(json!({
         "choices": [{ "message": accumulator.into_message() }]
     }))
+}
+
+async fn await_model_io<T, F>(
+    future: F,
+    run_context: &RunContext,
+    operation: &str,
+) -> Result<T, String>
+where
+    F: Future<Output = reqwest::Result<T>>,
+{
+    tokio::pin!(future);
+    let mut cancellation = tokio::time::interval(MODEL_CANCEL_POLL_INTERVAL);
+    cancellation.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.tick() => run_context.ensure_active()?,
+            result = &mut future => {
+                return result.map_err(|error| format!("{operation}: {error}"));
+            }
+        }
+    }
+}
+
+fn apply_openai_sse_line(
+    line: &str,
+    accumulator: &mut OpenAiStreamAccumulator,
+    run_context: &RunContext,
+    prefix_before_content: bool,
+    prefixed: &mut bool,
+) -> Result<bool, String> {
+    let trimmed = line.trim();
+    let Some(data) = trimmed.strip_prefix("data:") else {
+        return Ok(false);
+    };
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(false);
+    }
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    let chunk = serde_json::from_str::<Value>(data)
+        .map_err(|error| format!("invalid model stream JSON: {error}"))?;
+    for delta in accumulator.apply_chunk(&chunk)? {
+        if prefix_before_content && !*prefixed {
+            run_context.emit("agent.delta", json!({ "delta": "\n\n" }));
+            *prefixed = true;
+        }
+        run_context.emit("agent.delta", json!({ "delta": delta }));
+    }
+    Ok(false)
 }
 
 fn settings_json(settings: &Settings, configured: bool) -> Value {
@@ -2715,6 +3123,7 @@ fn write_message(value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
 
     fn test_bridge() -> (HostBridge, mpsc::Receiver<Value>) {
         let (outbound, output) = mpsc::channel();
@@ -2796,6 +3205,112 @@ mod tests {
     }
 
     #[test]
+    fn openai_sse_decoder_handles_arbitrary_chunk_boundaries() {
+        let (bridge, output) = test_bridge();
+        let context = RunContext {
+            run_id: "run-stream-test".to_string(),
+            conversation_id: "conversation-stream-test".to_string(),
+            client_id: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            bridge,
+        };
+        let mut decoder = SseLineDecoder::default();
+        let mut accumulator = OpenAiStreamAccumulator::default();
+        let mut prefixed = false;
+        let mut done = false;
+
+        assert!(
+            decoder
+                .push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hel")
+                .unwrap()
+                .is_empty()
+        );
+        for line in decoder.push(b"lo\"}}]}\r\n\r\ndata: [DO").unwrap() {
+            done |= apply_openai_sse_line(&line, &mut accumulator, &context, false, &mut prefixed)
+                .unwrap();
+        }
+        for line in decoder.push(b"NE]\n").unwrap() {
+            done |= apply_openai_sse_line(&line, &mut accumulator, &context, false, &mut prefixed)
+                .unwrap();
+        }
+
+        assert!(done);
+        assert!(decoder.finish().unwrap().is_empty());
+        assert_eq!(accumulator.into_message()["content"], "hello");
+        let event = output.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "agent.delta");
+        assert_eq!(event["payload"]["delta"], "hello");
+    }
+
+    #[test]
+    fn model_stream_cancellation_interrupts_a_stalled_http_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (ready_sender, ready_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            stream.flush().unwrap();
+            ready_sender.send(()).unwrap();
+            let _ = release_receiver.recv_timeout(Duration::from_secs(5));
+        });
+
+        let (bridge, _output) = test_bridge();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let context = RunContext {
+            run_id: "run-cancel-http-test".to_string(),
+            conversation_id: "conversation-cancel-http-test".to_string(),
+            client_id: None,
+            cancelled: cancelled.clone(),
+            bridge,
+        };
+        let endpoint = format!("http://{address}/chat/completions");
+        let settings = Settings {
+            model_name: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            ..Settings::default()
+        };
+        let (result_sender, result_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let result = call_openai_chat_stream(
+                &http,
+                &endpoint,
+                &settings,
+                &[json!({ "role": "user", "content": "hello" })],
+                &[],
+                &context,
+                false,
+            );
+            result_sender.send(result).unwrap();
+        });
+
+        ready_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("model request did not reach the stalled response body");
+        let cancelled_at = Instant::now();
+        cancelled.store(true, Ordering::SeqCst);
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled model request did not stop promptly");
+        assert_eq!(result.unwrap_err(), "run cancelled");
+        assert!(cancelled_at.elapsed() < Duration::from_secs(1));
+
+        release_sender.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn openai_stream_surfaces_provider_errors() {
         let mut accumulator = OpenAiStreamAccumulator::default();
         let error = accumulator
@@ -2817,7 +3332,7 @@ mod tests {
             Request {
                 id: "cancel-request".to_string(),
                 method: "agent.cancel".to_string(),
-                params: json!({ "run_id": "run-test" }),
+                params: json!({ "run_id": "run-test", "client_id": "client-test" }),
             },
             &bridge,
             &runs,
@@ -2830,12 +3345,14 @@ mod tests {
         let event = output.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(event["event"], "agent.cancelled");
         assert_eq!(event["payload"]["run_id"], "run-test");
+        assert_eq!(event["payload"]["client_id"], "client-test");
     }
 
     #[test]
     fn agent_start_returns_before_the_run_error_event() {
         let (bridge, output) = test_bridge();
         let runs: RunRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let conversations: ConversationRegistry = Arc::new(Mutex::new(HashMap::new()));
         let settings = Settings {
             workspace_dir: String::new(),
             browser_tools_mode: "off".to_string(),
@@ -2845,22 +3362,82 @@ mod tests {
             Request {
                 id: "start-request".to_string(),
                 method: "agent.start".to_string(),
-                params: json!({ "message": "hello", "mode": "chat" }),
+                params: json!({
+                    "message": "hello",
+                    "mode": "chat",
+                    "client_id": "client-test",
+                }),
             },
             &settings,
             &bridge,
             &runs,
+            &conversations,
         );
 
         let response = output.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(response["id"], "start-request");
         let run_id = response["result"]["run_id"].as_str().unwrap();
+        assert!(response["result"]["conversation_id"].as_str().is_some());
         let status = output.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(status["event"], "agent.status");
         assert_eq!(status["payload"]["run_id"], run_id);
+        assert_eq!(status["payload"]["client_id"], "client-test");
+        assert_eq!(
+            status["payload"]["conversation_id"],
+            response["result"]["conversation_id"]
+        );
         let error = output.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(error["event"], "agent.error");
         assert_eq!(error["payload"]["run_id"], run_id);
+    }
+
+    #[test]
+    fn conversation_turns_are_bounded_and_resettable() {
+        let conversations: ConversationRegistry = Arc::new(Mutex::new(HashMap::new()));
+        for index in 0..20 {
+            assert!(
+                append_conversation_turn_if_active(
+                    &conversations,
+                    "conversation-test",
+                    &format!("user {index}"),
+                    &format!("assistant {index}"),
+                    None,
+                )
+                .unwrap()
+            );
+        }
+
+        let messages = conversation_messages(&conversations, "conversation-test").unwrap();
+        assert_eq!(messages.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(messages[0]["content"], "user 8");
+
+        let (bridge, output) = test_bridge();
+        reset_conversation(
+            Request {
+                id: "reset-request".to_string(),
+                method: "conversation.reset".to_string(),
+                params: json!({ "conversation_id": "conversation-test" }),
+            },
+            &bridge,
+            &conversations,
+        );
+        let response = output.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(response["result"]["cleared"], true);
+        assert!(
+            conversation_messages(&conversations, "conversation-test")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn conversation_ids_are_validated() {
+        assert!(resolve_conversation_id(&json!({ "conversation_id": 42 })).is_err());
+        assert!(resolve_conversation_id(&json!({ "conversation_id": "bad/id" })).is_err());
+        assert_eq!(
+            resolve_conversation_id(&json!({ "conversation_id": "conversation.test-1" })).unwrap(),
+            "conversation.test-1"
+        );
     }
 
     #[test]

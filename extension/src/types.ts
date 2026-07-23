@@ -71,11 +71,14 @@ export type AgentRunResult = {
 
 export type AgentStartResult = {
   run_id: string
+  conversation_id: string
   state: 'queued'
 }
 
 export type AgentEventPayload = {
   run_id: string
+  conversation_id?: string
+  client_id?: string
   state?: string
   result?: AgentRunResult
   error?: {

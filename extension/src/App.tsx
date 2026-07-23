@@ -154,6 +154,8 @@ export function App() {
   const tabPickerButtonRef = useRef<HTMLButtonElement>(null)
   const workspacePickerButtonRef = useRef<HTMLButtonElement>(null)
   const activeRunIdRef = useRef<string | null>(null)
+  const conversationIdRef = useRef<string | null>(null)
+  const clientIdRef = useRef(createId())
   const startingRunRef = useRef(false)
   const finishedBeforeStartResponseRef = useRef(new Set<string>())
 
@@ -192,8 +194,15 @@ export function App() {
       const payload = event.payload as AgentEventPayload | undefined
       if (!payload?.run_id) return
       const currentRunId = activeRunIdRef.current
+      if (!currentRunId && startingRunRef.current && payload.client_id !== clientIdRef.current) {
+        return
+      }
+      if (payload.client_id && payload.client_id !== clientIdRef.current) return
       if (payload.run_id !== currentRunId && !(startingRunRef.current && !currentRunId)) {
         return
+      }
+      if (payload.conversation_id && !conversationIdRef.current) {
+        conversationIdRef.current = payload.conversation_id
       }
       if (!currentRunId) {
         activeRunIdRef.current = payload.run_id
@@ -373,20 +382,28 @@ export function App() {
     }
   }
 
-  async function startNewChat() {
+  function startNewChat() {
     const runId = activeRunIdRef.current
+    const conversationId = conversationIdRef.current
     activeRunIdRef.current = null
+    conversationIdRef.current = null
     startingRunRef.current = false
     setActiveRunId(null)
     setBusy(false)
     if (runId) {
-      await callNative('agent.cancel', { run_id: runId }).catch(() => undefined)
+      void callNative('agent.cancel', { run_id: runId, client_id: clientIdRef.current }).catch(
+        () => undefined,
+      )
+    }
+    if (conversationId) {
+      void callNative('conversation.reset', { conversation_id: conversationId }).catch(
+        () => undefined,
+      )
     }
     setMessages([])
     setPrompt('')
     setAttachedTabs([])
     setHealth({ kind: 'idle', text: 'Chat reset' })
-    await callNative('agent.reset').catch(() => undefined)
     inputRef.current?.focus()
   }
 
@@ -395,7 +412,7 @@ export function App() {
     if (!runId) return
     setHealth({ kind: 'checking', text: 'Cancelling...' })
     try {
-      await callNative('agent.cancel', { run_id: runId })
+      await callNative('agent.cancel', { run_id: runId, client_id: clientIdRef.current })
     } catch (error) {
       const text = error instanceof Error ? error.message : String(error)
       setHealth({ kind: 'error', text: `Cancel failed: ${text}` })
@@ -546,10 +563,6 @@ export function App() {
   async function submitPrompt() {
     const raw = prompt.trim()
     if (!raw || busy) return
-    const history = messages
-      .filter((message) => message.role === 'user' || message.role === 'assistant')
-      .map((message) => ({ role: message.role, content: message.content }))
-
     setPrompt('')
     setBusy(true)
     startingRunRef.current = true
@@ -567,7 +580,8 @@ export function App() {
     try {
       const started = await callNative<AgentStartResult>('agent.start', {
         message: raw,
-        history,
+        client_id: clientIdRef.current,
+        ...(conversationIdRef.current ? { conversation_id: conversationIdRef.current } : {}),
         mode,
         attached_tabs: attachedTabs.map((tab) => ({
           tabId: tab.id,
@@ -576,6 +590,7 @@ export function App() {
         })),
       })
       if (finishedBeforeStartResponseRef.current.delete(started.run_id)) return
+      conversationIdRef.current = started.conversation_id
       activeRunIdRef.current = started.run_id
       startingRunRef.current = false
       setActiveRunId(started.run_id)

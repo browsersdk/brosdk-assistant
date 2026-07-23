@@ -161,7 +161,11 @@ Starting a run returns a `run_id` immediately:
 ```json
 {
   "id": "request-1",
-  "result": { "run_id": "run-1", "state": "queued" }
+  "result": {
+    "run_id": "run-1",
+    "conversation_id": "conversation-1",
+    "state": "queued"
+  }
 }
 ```
 
@@ -185,16 +189,22 @@ Implemented behavior:
 - the main input loop remains available while runs execute on worker threads,
 - extension-tool responses are correlated through per-call waiters,
 - cancellation is acknowledged immediately and suppresses late run events,
+- async model requests select between network progress and cancellation, so
+  pending response-header, response-body, and non-SSE reads are dropped without
+  waiting for the request timeout,
 - OpenAI-compatible SSE content is forwarded through `agent.delta`,
+- SSE lines are reconstructed across arbitrary HTTP chunk boundaries with a
+  bounded per-line buffer,
 - streamed tool-call ids, names, and arguments are reconstructed by index,
 - tool failures are returned to the model when recovery is possible,
+- each side-panel instance supplies a `client_id` so broadcast run events do
+  not leak into another panel's UI state,
+- the native host owns bounded conversation context for asynchronous runs and
+  exposes `conversation.get` and `conversation.reset`,
 - `agent.run` remains as a blocking compatibility entrypoint.
 
 Remaining v0.2.0 work:
 
-- make cancellation interrupt stalled or non-streaming HTTP reads instead of
-  waiting for the next stream chunk or request timeout,
-- move conversation ownership from the side panel to the native host,
 - split the native host into protocol, provider, agent, and tool modules.
 
 Native Messaging output is limited to 1 MB per message. Large model output,
@@ -204,10 +214,16 @@ by identifier.
 ## Conversation Context
 
 - A conversation has a stable identifier.
-- Prior user and assistant messages are sent in order.
-- Tool calls and tool results stay paired.
+- `agent.start` loads prior completed user and assistant turns from the native
+  host instead of trusting history supplied by the side panel.
+- Only successful completed turns are committed; failed and cancelled runs do
+  not enter later context.
 - Context is bounded by message count and serialized size before provider calls.
-- New Chat creates a new context rather than only clearing visible UI.
+- The host retains at most 50 in-memory conversations, 24 messages per
+  conversation, and 64 KB of serialized context.
+- New Chat calls `conversation.reset` before continuing with a new identifier.
+- Tool-call traces and conversation persistence across native-host restarts are
+  future work.
 - Provider-specific token accounting will replace simple size limits later.
 
 ## Provider Policy
