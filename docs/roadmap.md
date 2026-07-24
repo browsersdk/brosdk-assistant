@@ -156,6 +156,10 @@ mark them read-only and non-destructive; Agent Mode remains capability-complete.
 Browser mutations, workspace writes, and MCP tools that are not explicitly
 read-only now pause for a run-bound, client-bound user confirmation. Denials and
 decisions are recorded with tool results.
+Completed run details are retained in a bounded native-host cache and loaded by
+`run_id` only when the user opens the answer detail panel. `agent.done` now
+contains the answer and summary counts instead of duplicating prompts, tool
+schemas, model messages, and tool outputs into every UI message.
 
 - Bind snapshot refs to a tab, document, and revision.
 - Improve controlled-input typing and event dispatch.
@@ -220,11 +224,10 @@ The roadmap should be judged by behavior, not feature count:
 
 ## Immediate Implementation Order
 
-1. Move full run details behind an explicit `run_id` lookup.
-2. Split extension browser execution into focused tool, snapshot, navigation,
+1. Split extension browser execution into focused tool, snapshot, navigation,
    and DOM modules.
-3. Add wait, scroll, and screenshot, then add select, keyboard, and tab lifecycle
+2. Add wait, scroll, and screenshot, then add select, keyboard, and tab lifecycle
    operations under the confirmation policy.
-4. Expand the controlled browser suite to summaries, forms, navigation, and
+3. Expand the controlled browser suite to summaries, forms, navigation, and
    cancellation.
-5. Harden packaging, security, and cross-platform installation.
+4. Harden packaging, security, and cross-platform installation.

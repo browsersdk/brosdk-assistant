@@ -341,6 +341,24 @@ async function run() {
     await targetPage.getByRole('heading', { name: 'Navigation complete' }).waitFor()
     assert.deepEqual(pageErrors, [])
 
+    const sidepanelErrors = []
+    const sidepanelPage = await context.newPage()
+    sidepanelPage.on('pageerror', (error) => sidepanelErrors.push(error.message))
+    await sidepanelPage.goto(`chrome-extension://${extensionId}/sidepanel.html`)
+    const composer = sidepanelPage.locator('textarea')
+    await composer.waitFor()
+    await composer.fill('Inspect lazy details')
+    await sidepanelPage.getByRole('button', { name: 'Send' }).click()
+    await sidepanelPage.getByText('Lazy details answer', { exact: true }).waitFor()
+    assert.equal(
+      await sidepanelPage.getByText('lazy-details-system-prompt', { exact: false }).count(),
+      0,
+    )
+    await sidepanelPage.getByRole('button', { name: 'View run details' }).click()
+    await sidepanelPage.getByRole('heading', { name: 'Run details' }).waitFor()
+    await sidepanelPage.getByText('lazy-details-system-prompt', { exact: false }).waitFor()
+    assert.deepEqual(sidepanelErrors, [])
+
     console.log(`PASS browser_tabs extension_id=${extensionId}`)
     console.log('PASS browser_active_tab controlled_page')
     console.log('PASS browser_read_page controlled_content')
@@ -351,6 +369,7 @@ async function run() {
     console.log('PASS browser_type controlled_input_events cancellation and diagnostics')
     console.log('PASS browser_click target diagnostics and page_state')
     console.log('PASS browser_navigate timeout complete and final_url diagnostics')
+    console.log('PASS sidepanel run details lazy lookup')
     console.log('Chrome extension smoke test passed')
   } finally {
     await context?.close()

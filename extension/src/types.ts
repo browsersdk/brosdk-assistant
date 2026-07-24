@@ -69,9 +69,7 @@ export type AgentRunResult = {
   mcp_tool_count: number
   extension_tool_count?: number
   workspace_tool_count?: number
-  tools?: unknown[]
-  tool_name_map?: Record<string, string>
-  debug?: AgentRunDebugInfo
+  details_available?: boolean
 }
 
 export type AgentStartResult = {
@@ -127,6 +125,17 @@ export type AgentRunDebugInfo = {
   tool_name_map?: Record<string, string>
   tools?: unknown[]
   tool_results?: unknown[]
+  details_truncated?: boolean
+  messages_omitted?: number
+  tool_results_omitted?: number
+  tools_omitted?: number
+}
+
+export type AgentRunDetailsResult = {
+  run_id: string
+  conversation_id: string
+  state: 'completed'
+  debug: AgentRunDebugInfo
 }
 
 export type SettingsResult = {
@@ -171,7 +180,7 @@ export type ChatMessage = {
   role: 'user' | 'assistant' | 'error'
   content: string
   time: string
-  debug?: AgentRunDebugInfo
   runId?: string
+  detailsAvailable?: boolean
   streaming?: boolean
 }

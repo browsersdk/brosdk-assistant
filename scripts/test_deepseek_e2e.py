@@ -312,7 +312,14 @@ def run_test(args: argparse.Namespace, api_key: str) -> None:
             first_answer = str(first.get("message", ""))
             require(first_answer.strip(), "first model response was empty")
             require(first.get("workspace_tool_count") == 3, "chat workspace tools were not exposed")
-            tool_results = first.get("tool_results") or []
+            require(first.get("details_available") is True, "first run details were not retained")
+            require("debug" not in first, "agent.done still contained inline debug details")
+            details = host.request(
+                "agent.run_details",
+                {"run_id": first_run_id},
+                args.timeout,
+            )
+            tool_results = (details.get("debug") or {}).get("tool_results") or []
             require(
                 any(result.get("tool_name") == "workspace_read_file" for result in tool_results),
                 "model did not call workspace_read_file",

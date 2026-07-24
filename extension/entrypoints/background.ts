@@ -214,6 +214,103 @@ export default defineBackground(() => {
     return { connected, lastError }
   }
 
+  function handleTestNativeRequest(request: NativeRequest): unknown | undefined {
+    if (import.meta.env.MODE !== 'test') return undefined
+
+    if (request.method === 'agent.health') {
+      return {
+        ok: true,
+        service: 'brosdk-assistant-native-test',
+        version: '0.2.0',
+        pid: 1,
+      }
+    }
+
+    if (request.method === 'settings.get') {
+      return normalizeSettings({
+        ...DEFAULT_SETTINGS,
+        model_base_url: 'https://example.test/v1',
+        model_name: 'test-model',
+        api_key: 'test-key',
+        browser_tools_mode: 'extension',
+      })
+    }
+
+    if (request.method === 'agent.start') {
+      const params = isRecord(request.params) ? request.params : {}
+      const clientId = stringParam(params, 'client_id')
+      const runId = 'run-extension-ui-test'
+      const conversationId = 'conversation-extension-ui-test'
+
+      setTimeout(() => {
+        void chrome.runtime.sendMessage({
+          type: 'native.event',
+          event: {
+            event: 'agent.delta',
+            payload: {
+              run_id: runId,
+              conversation_id: conversationId,
+              client_id: clientId,
+              delta: 'Lazy details answer',
+            },
+          },
+        }).catch(() => undefined)
+        setTimeout(() => {
+          void chrome.runtime.sendMessage({
+            type: 'native.event',
+            event: {
+              event: 'agent.done',
+              payload: {
+                run_id: runId,
+                conversation_id: conversationId,
+                client_id: clientId,
+                result: {
+                  accepted: true,
+                  message: 'Lazy details answer',
+                  llm_tool_count: 3,
+                  mcp_tool_count: 0,
+                  extension_tool_count: 3,
+                  workspace_tool_count: 0,
+                  details_available: true,
+                },
+              },
+            },
+          }).catch(() => undefined)
+        }, 10)
+      }, 10)
+
+      return { run_id: runId, conversation_id: conversationId, state: 'queued' }
+    }
+
+    if (request.method === 'agent.run_details') {
+      const params = isRecord(request.params) ? request.params : {}
+      if (
+        stringParam(params, 'run_id') !== 'run-extension-ui-test' ||
+        !stringParam(params, 'client_id')
+      ) {
+        return undefined
+      }
+      return {
+        run_id: 'run-extension-ui-test',
+        conversation_id: 'conversation-extension-ui-test',
+        state: 'completed',
+        debug: {
+          system_prompt: 'lazy-details-system-prompt',
+          user_message: 'Inspect lazy details',
+          messages: [],
+          llm_tool_count: 3,
+          mcp_tool_count: 0,
+          extension_tool_count: 3,
+          workspace_tool_count: 0,
+          tools: [],
+          tool_results: [],
+        },
+      }
+    }
+
+    return undefined
+  }
+
   async function handleExtensionToolRequest(payload: unknown) {
     const request = payload as { id?: string; name?: string; arguments?: unknown }
     if (!request.id || !request.name) return
@@ -594,6 +691,11 @@ export default defineBackground(() => {
     }
 
     if (message?.type === 'native.request') {
+      const testResult = handleTestNativeRequest(message.request)
+      if (testResult !== undefined) {
+        sendResponse({ ok: true, data: testResult } satisfies BackgroundResponse)
+        return false
+      }
       requestNative(message.request)
         .then((data) => {
           sendResponse({ ok: true, data } satisfies BackgroundResponse)

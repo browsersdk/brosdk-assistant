@@ -34,6 +34,8 @@ import {
 import type {
   AgentEventPayload,
   AgentConfirmationRequest,
+  AgentRunDebugInfo,
+  AgentRunDetailsResult,
   AgentStartResult,
   BackgroundRequest,
   ChatMessage,
@@ -293,7 +295,8 @@ export function App() {
                 role: 'assistant',
                 content: payload.result?.message || 'Completed.',
                 time: nowLabel(),
-                debug: payload.result?.debug,
+                runId: payload.run_id,
+                detailsAvailable: payload.result?.details_available === true,
               },
             ]
           }
@@ -302,7 +305,7 @@ export function App() {
               ? {
                   ...message,
                   content: payload.result?.message || message.content || 'Completed.',
-                  debug: payload.result?.debug,
+                  detailsAvailable: payload.result?.details_available === true,
                   streaming: false,
                 }
               : message,
@@ -664,6 +667,14 @@ export function App() {
     }
   }
 
+  async function loadRunDetails(runId: string) {
+    const details = await callNative<AgentRunDetailsResult>('agent.run_details', {
+      run_id: runId,
+      client_id: clientIdRef.current,
+    })
+    return details.debug
+  }
+
   function openOptionsPage() {
     const url = chrome.runtime.getURL('settings.html')
     void chrome.tabs.create({ active: true, url }).catch(() => chrome.runtime.openOptionsPage())
@@ -719,7 +730,13 @@ export function App() {
             }}
           />
         ) : (
-          messages.map((message) => <MessageBubble key={message.id} message={message} />)
+          messages.map((message) => (
+            <MessageBubble
+              key={message.id}
+              message={message}
+              onLoadDetails={loadRunDetails}
+            />
+          ))
         )}
       </div>
 
@@ -1285,22 +1302,52 @@ function EmptyState({
   )
 }
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({
+  message,
+  onLoadDetails,
+}: {
+  message: ChatMessage
+  onLoadDetails: (runId: string) => Promise<AgentRunDebugInfo>
+}) {
   const [debugOpen, setDebugOpen] = useState(false)
+  const [debug, setDebug] = useState<AgentRunDebugInfo | null>(null)
+  const [debugLoading, setDebugLoading] = useState(false)
+  const [debugError, setDebugError] = useState<string | null>(null)
+
+  async function loadDetails() {
+    if (!message.runId || debugLoading) return
+    setDebugOpen(true)
+    if (debug) return
+    setDebugLoading(true)
+    setDebugError(null)
+    try {
+      setDebug(await onLoadDetails(message.runId))
+    } catch (error) {
+      setDebugError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setDebugLoading(false)
+    }
+  }
+
   return (
     <article className={`message ${message.role}`}>
       <div className="message-meta">
         <strong>{message.role === 'user' ? 'You' : message.role === 'error' ? 'Error' : 'Agent'}</strong>
         <span className="message-meta-actions">
           <span>{message.time}</span>
-          {message.debug && (
+          {message.runId && message.detailsAvailable && (
             <button
               className="message-debug-button"
               type="button"
               title="View run details"
-              onClick={() => setDebugOpen(true)}
+              disabled={debugLoading}
+              onClick={() => void loadDetails()}
             >
-              <Info size={14} />
+              {debugLoading ? (
+                <LoaderCircle className="working-spinner" size={14} />
+              ) : (
+                <Info size={14} />
+              )}
             </button>
           )}
         </span>
@@ -1312,8 +1359,14 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           message.content
         )}
       </div>
-      {debugOpen && message.debug && (
-        <RunDetailsDialog debug={message.debug} onClose={() => setDebugOpen(false)} />
+      {debugOpen && (
+        <RunDetailsDialog
+          debug={debug}
+          error={debugError}
+          loading={debugLoading}
+          onClose={() => setDebugOpen(false)}
+          onRetry={() => void loadDetails()}
+        />
       )}
     </article>
   )
@@ -1465,10 +1518,16 @@ function renderInlineMarkdown(text: string) {
 
 function RunDetailsDialog({
   debug,
+  error,
+  loading,
   onClose,
+  onRetry,
 }: {
-  debug: NonNullable<ChatMessage['debug']>
+  debug: AgentRunDebugInfo | null
+  error: string | null
+  loading: boolean
   onClose: () => void
+  onRetry: () => void
 }) {
   return (
     <div className="run-details-backdrop" role="presentation" onClick={onClose}>
@@ -1482,16 +1541,34 @@ function RunDetailsDialog({
         <header className="run-details-header">
           <div>
             <h2>Run details</h2>
-            <p>
-              {debug.llm_tool_count} LLM tools · {debug.mcp_tool_count} MCP tools ·{' '}
-              {debug.extension_tool_count ?? 0} extension tools
-            </p>
+            {debug && (
+              <p>
+                {debug.llm_tool_count} LLM tools · {debug.mcp_tool_count} MCP tools ·{' '}
+                {debug.extension_tool_count ?? 0} extension tools
+              </p>
+            )}
           </div>
           <button className="icon-button" type="button" title="Close" onClick={onClose}>
             <X size={16} />
           </button>
         </header>
-        <pre className="run-details-content">{JSON.stringify(debug, null, 2)}</pre>
+        {loading ? (
+          <div className="run-details-status">
+            <LoaderCircle className="working-spinner" size={18} />
+            Loading run details...
+          </div>
+        ) : error ? (
+          <div className="run-details-status error">
+            <CircleAlert size={18} />
+            <span>{error}</span>
+            <button type="button" onClick={onRetry}>
+              <RefreshCw size={14} />
+              Retry
+            </button>
+          </div>
+        ) : debug ? (
+          <pre className="run-details-content">{JSON.stringify(debug, null, 2)}</pre>
+        ) : null}
       </section>
     </div>
   )

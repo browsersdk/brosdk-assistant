@@ -8,8 +8,9 @@ mod mcp_integration_tests;
 
 use agent::{
     ConfirmationDecision, ConfirmationRegistry, ConversationRegistry, MAX_HISTORY_BYTES,
-    MAX_HISTORY_MESSAGES, RunContext, RunRegistry, cancel_agent_run, get_conversation,
-    reset_agent_runs, reset_conversation, resolve_confirmation, start_agent_run,
+    MAX_HISTORY_MESSAGES, RunContext, RunDetailsRegistry, RunRegistry, cancel_agent_run,
+    get_conversation, get_run_details, reset_agent_runs, reset_conversation, resolve_confirmation,
+    start_agent_run,
 };
 use protocol::{HostBridge, Request, Response, err, ok, read_message, start_stdout_bridge};
 use providers::openai::OpenAiProvider;
@@ -76,6 +77,7 @@ fn main() {
     let runs = RunRegistry::default();
     let conversations = ConversationRegistry::default();
     let confirmations = ConfirmationRegistry::default();
+    let run_details = RunDetailsRegistry::default();
     let ready = json!({
         "event": "native.ready",
         "payload": {
@@ -120,6 +122,7 @@ fn main() {
                     &runs,
                     &conversations,
                     &confirmations,
+                    &run_details,
                 );
             }
             "agent.cancel" => {
@@ -130,6 +133,9 @@ fn main() {
             }
             "agent.confirm" => {
                 resolve_confirmation(request, &bridge, &confirmations);
+            }
+            "agent.run_details" => {
+                get_run_details(request, &bridge, &run_details);
             }
             "conversation.get" => {
                 get_conversation(request, &bridge, &conversations);

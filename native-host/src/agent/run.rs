@@ -1,4 +1,5 @@
 use super::confirmation::{ConfirmationDecision, ConfirmationRegistry, ConfirmationRequest};
+use super::details::RunDetailsRegistry;
 use crate::protocol::{HostBridge, Request, err, ok};
 use crate::{Settings, run_agent, settings_from_params};
 use serde::Serialize;
@@ -122,6 +123,7 @@ pub(crate) fn start_agent_run(
     runs: &RunRegistry,
     conversations: &ConversationRegistry,
     confirmations: &ConfirmationRegistry,
+    details: &RunDetailsRegistry,
 ) {
     let run_id = format!(
         "run-{}-{}",
@@ -202,6 +204,7 @@ pub(crate) fn start_agent_run(
     };
     let active_runs = runs.clone();
     let conversation_registry = conversations.clone();
+    let run_details = details.clone();
     thread::spawn(move || {
         if !context.is_cancelled() {
             context.emit("agent.status", json!({ "state": "running" }));
@@ -214,7 +217,7 @@ pub(crate) fn start_agent_run(
         );
         if !context.is_cancelled() {
             match result {
-                Ok(result) => {
+                Ok(mut result) => {
                     let saved = user_message
                         .as_deref()
                         .zip(result.get("message").and_then(Value::as_str))
@@ -230,7 +233,20 @@ pub(crate) fn start_agent_run(
                         .transpose();
                     match saved {
                         Ok(Some(false)) => {}
-                        Ok(_) => context.emit("agent.done", json!({ "result": result })),
+                        Ok(_) => {
+                            if let Err(error) = run_details.store_completed(
+                                &run_id,
+                                &conversation_id,
+                                context.client_id.as_deref(),
+                                &mut result,
+                            ) {
+                                eprintln!("[native] failed to store run details: {error}");
+                                if let Some(fields) = result.as_object_mut() {
+                                    fields.insert("details_available".to_string(), json!(false));
+                                }
+                            }
+                            context.emit("agent.done", json!({ "result": result }));
+                        }
                         Err(error) => context.emit(
                             "agent.error",
                             json!({
@@ -519,6 +535,7 @@ mod tests {
         let runs = RunRegistry::default();
         let conversations = ConversationRegistry::default();
         let confirmations = ConfirmationRegistry::default();
+        let details = RunDetailsRegistry::default();
         let settings = Settings {
             workspace_dir: String::new(),
             browser_tools_mode: "off".to_string(),
@@ -539,6 +556,7 @@ mod tests {
             &runs,
             &conversations,
             &confirmations,
+            &details,
         );
 
         let response = output.recv_timeout(Duration::from_secs(1)).unwrap();

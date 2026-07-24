@@ -143,6 +143,11 @@ panel. Closing the side panel leaves the request pending until it times out.
 - **Off:** disables browser tools while model chat and selected-workspace tools
   remain available.
 
+Each completed answer can expose an information button. Full prompts, tool
+schemas, model messages, confirmation decisions, and tool results are fetched
+from the native host by `run_id` only when that panel is opened; old in-memory
+details can be evicted.
+
 Workspace tools are exposed only after a workspace is selected. All paths are
 scoped to that root, and symlink or parent traversal escapes are rejected.
 

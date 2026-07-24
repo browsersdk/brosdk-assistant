@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- Detached full prompts, model messages, tool schemas, and tool results from
+  `agent.done`; the answer detail panel now loads bounded native-host diagnostics
+  explicitly through `agent.run_details` and `run_id`.
+
 ## 0.2.0 - 2026-07-24
 
 ### Added

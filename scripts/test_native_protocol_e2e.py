@@ -189,6 +189,21 @@ def run_test(args: argparse.Namespace) -> None:
                 require(run_state == "done", "mock protocol run did not complete")
                 answer = str(result.get("message", ""))
                 require("Protocol Test" in answer and "42" in answer, "final answer lost tool data")
+                require(result.get("details_available") is True, "run details were not retained")
+                require("debug" not in result, "agent.done still contained inline debug details")
+                require("tool_results" not in result, "agent.done still contained inline tool results")
+                details = host.request(
+                    "agent.run_details",
+                    {"run_id": run_id, "client_id": "native-protocol-e2e"},
+                    args.timeout,
+                )
+                require(details.get("run_id") == run_id, "run details returned the wrong run")
+                debug = details.get("debug") or {}
+                tool_results = debug.get("tool_results") or []
+                require(
+                    any(result.get("tool_name") == "browser_active_tab" for result in tool_results),
+                    "run details lost the extension tool result",
+                )
                 event_names = [event.get("event") for event in events]
                 require("extension.tool.request" in event_names, "extension tool request was not emitted")
                 require("agent.tool.started" in event_names, "tool start event was not emitted")
@@ -197,7 +212,7 @@ def run_test(args: argparse.Namespace) -> None:
                 require(len(state.requests) == 2, "mock model did not receive exactly two rounds")
                 print(
                     "PASS agent.start extension_tool_roundtrip "
-                    f"events={len(events)} health_ms={health_latency * 1000:.0f}"
+                    f"events={len(events)} details=lazy health_ms={health_latency * 1000:.0f}"
                 )
             finally:
                 state.release_first_response.set()

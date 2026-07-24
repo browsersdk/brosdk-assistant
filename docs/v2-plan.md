@@ -189,6 +189,27 @@ The host then emits bounded events:
 - `agent.error`
 - `agent.cancelled`
 
+`agent.done` is intentionally compact. It returns the final answer, capability
+counts, and `details_available`, but does not repeat the full system prompt,
+model messages, tool schemas, or tool results. The side panel requests those
+details only when the user opens the answer's detail panel:
+
+```json
+{
+  "id": "details-1",
+  "method": "agent.run_details",
+  "params": {
+    "run_id": "run-1",
+    "client_id": "side-panel-1"
+  }
+}
+```
+
+Completed details are memory-only, bound to the originating `client_id`, and
+bounded by entry count and a Native Messaging-safe serialized size. Old details
+may be evicted; oversized details retain prompt metadata and explicit omission
+counts.
+
 `agent.cancel` takes a `run_id`. The host must continue routing health,
 settings, and tool responses while a run is active. No request may be consumed
 and discarded while waiting for another response.
@@ -336,6 +357,9 @@ Current progress:
   and MCP tools without trustworthy read-only metadata cannot run until the
   side panel approves them; visible arguments redact entered text, file content,
   and common secret fields.
+- completed run diagnostics are detached from `agent.done`, stored in a bounded
+  native registry, and fetched explicitly through `agent.run_details` when the
+  user opens the per-answer detail panel.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not
