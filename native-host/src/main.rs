@@ -1286,7 +1286,20 @@ fn mcp_tool_allowed_in_chat_mode(tool: &Value) -> bool {
     if is_known_browser_mcp_tool(name) {
         return is_read_only_browser_mcp_tool(name);
     }
-    true
+    mcp_tool_annotations_allow_chat(tool)
+}
+
+fn mcp_tool_annotations_allow_chat(tool: &Value) -> bool {
+    let annotations = tool.get("annotations");
+    let read_only = annotations
+        .and_then(|value| value.get("readOnlyHint"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let destructive = annotations
+        .and_then(|value| value.get("destructiveHint"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    read_only && !destructive
 }
 
 fn is_known_browser_mcp_tool(name: &str) -> bool {
@@ -1709,14 +1722,26 @@ mod tests {
     }
 
     #[test]
-    fn chat_mode_filters_known_browser_mcp_tools() {
+    fn chat_mode_filters_mcp_tools_by_known_policy_and_annotations() {
         assert!(mcp_tool_allowed_in_chat_mode(&json!({"name": "tabs"})));
         assert!(mcp_tool_allowed_in_chat_mode(&json!({"name": "read"})));
         assert!(!mcp_tool_allowed_in_chat_mode(&json!({"name": "navigate"})));
         assert!(!mcp_tool_allowed_in_chat_mode(&json!({"name": "act"})));
-        assert!(mcp_tool_allowed_in_chat_mode(
-            &json!({"name": "custom_tool"})
-        ));
+        assert!(!mcp_tool_allowed_in_chat_mode(&json!({
+            "name": "custom_tool"
+        })));
+        assert!(mcp_tool_allowed_in_chat_mode(&json!({
+            "name": "custom_read",
+            "annotations": { "readOnlyHint": true }
+        })));
+        assert!(!mcp_tool_allowed_in_chat_mode(&json!({
+            "name": "custom_write",
+            "annotations": { "readOnlyHint": false }
+        })));
+        assert!(!mcp_tool_allowed_in_chat_mode(&json!({
+            "name": "contradictory_tool",
+            "annotations": { "readOnlyHint": true, "destructiveHint": true }
+        })));
     }
 
     #[test]

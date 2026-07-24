@@ -115,6 +115,15 @@ MCP is an optional advanced mode. The native host must remain server-agnostic:
 Changing an MCP server must not require changes to the native host unless the
 server violates or extends the MCP protocol.
 
+Chat Mode applies a capability policy after discovery:
+
+- known browser tools use the native host's conservative read-only allowlist and
+  argument guards,
+- unknown tools require standard `annotations.readOnlyHint=true`,
+- a contradictory `annotations.destructiveHint=true` causes denial,
+- missing annotations default to denial in Chat Mode but do not remove tools
+  from Agent Mode.
+
 ### Off
 
 No browser tools are exposed. Model chat and an explicitly selected workspace
@@ -319,6 +328,9 @@ Current progress:
   bounded diagnostics without echoing the entered text.
 - navigation listens for tab loading and completion, applies a bounded timeout,
   and returns `complete`, `timeout`, or `closed` with final URL and elapsed time.
+- generic MCP discovery preserves tool annotations. Chat Mode defaults unknown
+  tools to denied unless annotations explicitly mark them read-only and
+  non-destructive; Agent Mode continues to expose the discovered tool set.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not

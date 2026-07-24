@@ -87,6 +87,7 @@ fn mcp_initializes_discovers_invokes_and_closes_with_session() {
                 "tools": [{
                     "name": "mock_read",
                     "description": "Read mock data",
+                    "annotations": { "readOnlyHint": true },
                     "inputSchema": {
                         "type": "object",
                         "properties": { "query": { "type": "string" } }
@@ -108,6 +109,7 @@ fn mcp_initializes_discovers_invokes_and_closes_with_session() {
     client.connect().unwrap();
     let tools = client.list_tools().unwrap();
     assert_eq!(tools[0]["name"], "mock_read");
+    assert_eq!(tools[0]["annotations"]["readOnlyHint"], true);
     let result = client
         .call_tool("mock_read", json!({ "query": "hello" }))
         .unwrap();

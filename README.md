@@ -103,6 +103,10 @@ Browser tools source controls how the assistant reads or acts on browser pages:
 - `Chrome Extension` is the default for new installations.
 - `MCP Server` uses the configured MCP URL and is best when a CDP-backed MCP
   server is running.
+- In Chat Mode, MCP tools are exposed only when they are known read-only tools
+  or declare standard `annotations.readOnlyHint=true` without a contradictory
+  `destructiveHint=true`. Unannotated unknown tools remain available in Agent
+  Mode but are hidden from Chat Mode.
 - `Chrome Extension` uses extension APIs and injected scripts, so it can read
   page text, list tabs, snapshot actionable elements, extract links, navigate,
   click, and type without CDP.

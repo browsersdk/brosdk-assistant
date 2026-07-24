@@ -151,6 +151,8 @@ targets, cross-tab reuse, and navigation reuse now fail safely and request a new
 snapshot. DOM script errors are propagated instead of being reported as null
 successes. Text entry now uses native value setters with controlled-input event
 dispatch, and navigation reports bounded completion or timeout diagnostics.
+Unknown MCP tools are denied in Chat Mode unless standard annotations explicitly
+mark them read-only and non-destructive; Agent Mode remains capability-complete.
 
 - Bind snapshot refs to a tab, document, and revision.
 - Improve controlled-input typing and event dispatch.
@@ -215,8 +217,12 @@ The roadmap should be judged by behavior, not feature count:
 
 ## Immediate Implementation Order
 
-1. Add wait, scroll, select, keyboard, tab lifecycle, and screenshot tools.
-2. Add confirmation decisions for sensitive browser and workspace mutations.
-3. Expand the controlled browser suite to summaries, forms, navigation, and
+1. Add confirmation decisions for sensitive browser and workspace mutations.
+2. Move full run details behind an explicit `run_id` lookup.
+3. Split extension browser execution into focused tool, snapshot, navigation,
+   and DOM modules.
+4. Add wait, scroll, and screenshot, then add select, keyboard, and tab lifecycle
+   operations under the confirmation policy.
+5. Expand the controlled browser suite to summaries, forms, navigation, and
    cancellation.
-4. Harden packaging, security, and cross-platform installation.
+6. Harden packaging, security, and cross-platform installation.
