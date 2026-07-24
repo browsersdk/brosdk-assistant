@@ -94,6 +94,23 @@ export type AgentEventPayload = {
   tool_name?: string
   ok?: boolean
   delta?: string
+  confirmation_id?: string
+  summary?: string
+  arguments?: unknown
+  expires_in_ms?: number
+  decision?: 'approved' | 'denied'
+}
+
+export type AgentConfirmationRequest = {
+  run_id: string
+  conversation_id?: string
+  client_id?: string
+  confirmation_id: string
+  tool_call_id: string
+  tool_name: string
+  summary: string
+  arguments?: unknown
+  expires_in_ms?: number
 }
 
 export type AgentRunDebugInfo = {

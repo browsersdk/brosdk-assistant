@@ -1,3 +1,4 @@
+use super::confirmation::{ConfirmationDecision, ConfirmationRegistry, ConfirmationRequest};
 use crate::protocol::{HostBridge, Request, err, ok};
 use crate::{Settings, run_agent, settings_from_params};
 use serde::Serialize;
@@ -38,6 +39,7 @@ pub(crate) struct RunContext {
     client_id: Option<String>,
     cancelled: Arc<AtomicBool>,
     bridge: HostBridge,
+    confirmations: ConfirmationRegistry,
 }
 
 impl RunContext {
@@ -80,6 +82,37 @@ impl RunContext {
             let _ = self.bridge.send_event(event, payload);
         }
     }
+
+    pub(crate) fn confirm_tool(
+        &self,
+        tool_call_id: &str,
+        tool_name: &str,
+        summary: &str,
+        arguments: Value,
+    ) -> Result<ConfirmationDecision, String> {
+        let decision = self.confirmations.request(
+            &self.bridge,
+            self.cancelled.as_ref(),
+            ConfirmationRequest {
+                run_id: &self.run_id,
+                conversation_id: &self.conversation_id,
+                client_id: self.client_id.as_deref(),
+                tool_call_id,
+                tool_name,
+                summary,
+                arguments,
+            },
+        )?;
+        self.emit(
+            "agent.confirmation.resolved",
+            json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": tool_name,
+                "decision": decision.as_str(),
+            }),
+        );
+        Ok(decision)
+    }
 }
 
 pub(crate) fn start_agent_run(
@@ -88,6 +121,7 @@ pub(crate) fn start_agent_run(
     bridge: &HostBridge,
     runs: &RunRegistry,
     conversations: &ConversationRegistry,
+    confirmations: &ConfirmationRegistry,
 ) {
     let run_id = format!(
         "run-{}-{}",
@@ -164,6 +198,7 @@ pub(crate) fn start_agent_run(
         client_id,
         cancelled,
         bridge: bridge.clone(),
+        confirmations: confirmations.clone(),
     };
     let active_runs = runs.clone();
     let conversation_registry = conversations.clone();
@@ -483,6 +518,7 @@ mod tests {
         let (bridge, output) = test_bridge();
         let runs = RunRegistry::default();
         let conversations = ConversationRegistry::default();
+        let confirmations = ConfirmationRegistry::default();
         let settings = Settings {
             workspace_dir: String::new(),
             browser_tools_mode: "off".to_string(),
@@ -502,6 +538,7 @@ mod tests {
             &bridge,
             &runs,
             &conversations,
+            &confirmations,
         );
 
         let response = output.recv_timeout(Duration::from_secs(1)).unwrap();

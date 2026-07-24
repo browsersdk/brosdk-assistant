@@ -7,8 +7,9 @@ mod tools;
 mod mcp_integration_tests;
 
 use agent::{
-    ConversationRegistry, MAX_HISTORY_BYTES, MAX_HISTORY_MESSAGES, RunContext, RunRegistry,
-    cancel_agent_run, get_conversation, reset_agent_runs, reset_conversation, start_agent_run,
+    ConfirmationDecision, ConfirmationRegistry, ConversationRegistry, MAX_HISTORY_BYTES,
+    MAX_HISTORY_MESSAGES, RunContext, RunRegistry, cancel_agent_run, get_conversation,
+    reset_agent_runs, reset_conversation, resolve_confirmation, start_agent_run,
 };
 use protocol::{HostBridge, Request, Response, err, ok, read_message, start_stdout_bridge};
 use providers::openai::OpenAiProvider;
@@ -74,6 +75,7 @@ fn main() {
     let bridge = start_stdout_bridge();
     let runs = RunRegistry::default();
     let conversations = ConversationRegistry::default();
+    let confirmations = ConfirmationRegistry::default();
     let ready = json!({
         "event": "native.ready",
         "payload": {
@@ -111,13 +113,23 @@ fn main() {
 
         match request.method.as_str() {
             "agent.start" => {
-                start_agent_run(request, &settings, &bridge, &runs, &conversations);
+                start_agent_run(
+                    request,
+                    &settings,
+                    &bridge,
+                    &runs,
+                    &conversations,
+                    &confirmations,
+                );
             }
             "agent.cancel" => {
                 cancel_agent_run(request, &bridge, &runs);
             }
             "agent.reset" => {
                 reset_agent_runs(request, &bridge, &runs);
+            }
+            "agent.confirm" => {
+                resolve_confirmation(request, &bridge, &confirmations);
             }
             "conversation.get" => {
                 get_conversation(request, &bridge, &conversations);
@@ -504,13 +516,54 @@ fn run_openai_agent(
                 .unwrap_or("{}");
             let arguments = serde_json::from_str::<Value>(arguments_text)
                 .map_err(|error| format!("invalid tool arguments for {safe_name}: {error}"))?;
+            let requires_confirmation =
+                tool_requires_confirmation(&prepared.mcp_tools, original_name, &arguments);
+            let mut confirmation_status = None;
+            let mut confirmation_error = None;
+            if requires_confirmation {
+                match run_context {
+                    Some(context) => {
+                        let summary = tool_confirmation_summary(original_name, &arguments);
+                        let visible_arguments =
+                            tool_confirmation_arguments(original_name, &arguments);
+                        match context.confirm_tool(
+                            call_id,
+                            original_name,
+                            &summary,
+                            visible_arguments,
+                        ) {
+                            Ok(decision) => {
+                                confirmation_status = Some(decision.as_str());
+                                if decision == ConfirmationDecision::Denied {
+                                    confirmation_error = Some(format!(
+                                        "user denied confirmation for tool {original_name}"
+                                    ));
+                                }
+                            }
+                            Err(error) if context.is_cancelled() => return Err(error),
+                            Err(error) => {
+                                confirmation_status = Some("failed");
+                                confirmation_error = Some(error);
+                            }
+                        }
+                    }
+                    None => {
+                        confirmation_status = Some("unavailable");
+                        confirmation_error = Some(format!(
+                            "tool {original_name} requires confirmation through agent.start"
+                        ));
+                    }
+                }
+            }
             if let Some(context) = run_context {
                 context.emit(
                     "agent.tool.started",
                     json!({ "tool_call_id": call_id, "tool_name": original_name }),
                 );
             }
-            let execution = if workspace::is_tool(original_name) {
+            let execution = if let Some(error) = confirmation_error {
+                Err(error)
+            } else if workspace::is_tool(original_name) {
                 prepared
                     .workspace_root
                     .as_deref()
@@ -577,6 +630,7 @@ fn run_openai_agent(
                 "tool_call_id": call_id,
                 "tool_name": original_name,
                 "is_error": is_error,
+                "confirmation": confirmation_status,
                 "output": output,
             }));
         }
@@ -1279,6 +1333,162 @@ fn is_extension_browser_tool(name: &str) -> bool {
     )
 }
 
+fn tool_requires_confirmation(mcp_tools: &[Value], name: &str, arguments: &Value) -> bool {
+    if workspace::is_tool(name) {
+        return matches!(name, "workspace_write_file" | "workspace_edit_file");
+    }
+    if is_extension_browser_tool(name) {
+        return matches!(name, "browser_navigate" | "browser_click" | "browser_type");
+    }
+    if is_known_browser_mcp_tool(name) {
+        if browser_tool_name(name) == "tabs" {
+            let action = arguments
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("list");
+            return action != "list" && action != "active";
+        }
+        return !is_read_only_browser_mcp_tool(name);
+    }
+    mcp_tools
+        .iter()
+        .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+        .is_none_or(|tool| !mcp_tool_annotations_allow_chat(tool))
+}
+
+fn tool_confirmation_summary(name: &str, arguments: &Value) -> String {
+    match name {
+        "workspace_write_file" => format!(
+            "Write workspace file {}",
+            confirmation_string(arguments, "path", "(missing path)")
+        ),
+        "workspace_edit_file" => format!(
+            "Edit workspace file {}",
+            confirmation_string(arguments, "path", "(missing path)")
+        ),
+        "browser_navigate" => format!(
+            "Navigate to {}",
+            confirmation_string(arguments, "url", "(missing URL)")
+        ),
+        "browser_click" => format!(
+            "Click {}",
+            confirmation_target(arguments)
+                .unwrap_or_else(|| "the selected page element".to_string())
+        ),
+        "browser_type" => format!(
+            "Type into {}",
+            confirmation_target(arguments).unwrap_or_else(|| "the selected page field".to_string())
+        ),
+        _ => format!("Run MCP tool {name}"),
+    }
+}
+
+fn confirmation_string(arguments: &Value, key: &str, fallback: &str) -> String {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .map(|value| truncate_confirmation_text(value, 160))
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn confirmation_target(arguments: &Value) -> Option<String> {
+    ["ref", "selector", "text"]
+        .into_iter()
+        .find_map(|key| arguments.get(key).and_then(Value::as_str))
+        .map(|value| truncate_confirmation_text(value, 160))
+}
+
+fn tool_confirmation_arguments(name: &str, arguments: &Value) -> Value {
+    match name {
+        "workspace_write_file" => json!({
+            "path": arguments.get("path"),
+            "content_length": arguments
+                .get("content")
+                .and_then(Value::as_str)
+                .map(|value| value.chars().count()),
+        }),
+        "workspace_edit_file" => json!({
+            "path": arguments.get("path"),
+            "find_length": arguments
+                .get("find")
+                .and_then(Value::as_str)
+                .map(|value| value.chars().count()),
+            "replace_length": arguments
+                .get("replace")
+                .and_then(Value::as_str)
+                .map(|value| value.chars().count()),
+            "replace_all": arguments.get("replace_all"),
+        }),
+        "browser_type" => json!({
+            "tabId": arguments.get("tabId"),
+            "ref": arguments.get("ref"),
+            "selector": arguments.get("selector"),
+            "text_length": arguments
+                .get("text")
+                .and_then(Value::as_str)
+                .map(|value| value.chars().count()),
+        }),
+        _ => redact_confirmation_value(arguments, None),
+    }
+}
+
+fn redact_confirmation_value(value: &Value, key: Option<&str>) -> Value {
+    let should_hide = key.is_some_and(|key| {
+        let key = key.to_ascii_lowercase();
+        [
+            "password",
+            "secret",
+            "token",
+            "api_key",
+            "apikey",
+            "authorization",
+            "cookie",
+            "content",
+            "body",
+        ]
+        .iter()
+        .any(|sensitive| key.contains(sensitive))
+    });
+    if should_hide {
+        return match value.as_str() {
+            Some(text) => json!(format!("[{} characters hidden]", text.chars().count())),
+            None => json!("[hidden]"),
+        };
+    }
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        redact_confirmation_value(value, Some(name.as_str())),
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .take(20)
+                .map(|item| redact_confirmation_value(item, None))
+                .collect(),
+        ),
+        Value::String(text) => json!(truncate_confirmation_text(text, 300)),
+        _ => value.clone(),
+    }
+}
+
+fn truncate_confirmation_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix}...")
+    } else {
+        prefix
+    }
+}
+
 fn mcp_tool_allowed_in_chat_mode(tool: &Value) -> bool {
     let Some(name) = tool.get("name").and_then(Value::as_str) else {
         return false;
@@ -1742,6 +1952,75 @@ mod tests {
             "name": "contradictory_tool",
             "annotations": { "readOnlyHint": true, "destructiveHint": true }
         })));
+    }
+
+    #[test]
+    fn sensitive_tools_require_confirmation() {
+        let mcp_tools = vec![
+            json!({
+                "name": "custom_read",
+                "annotations": { "readOnlyHint": true }
+            }),
+            json!({ "name": "custom_unknown" }),
+        ];
+        assert!(tool_requires_confirmation(
+            &mcp_tools,
+            "workspace_write_file",
+            &json!({})
+        ));
+        assert!(!tool_requires_confirmation(
+            &mcp_tools,
+            "workspace_read_file",
+            &json!({})
+        ));
+        assert!(tool_requires_confirmation(
+            &mcp_tools,
+            "browser_click",
+            &json!({})
+        ));
+        assert!(!tool_requires_confirmation(
+            &mcp_tools,
+            "browser_snapshot",
+            &json!({})
+        ));
+        assert!(!tool_requires_confirmation(
+            &mcp_tools,
+            "tabs",
+            &json!({ "action": "active" })
+        ));
+        assert!(tool_requires_confirmation(
+            &mcp_tools,
+            "tabs",
+            &json!({ "action": "close" })
+        ));
+        assert!(!tool_requires_confirmation(
+            &mcp_tools,
+            "custom_read",
+            &json!({})
+        ));
+        assert!(tool_requires_confirmation(
+            &mcp_tools,
+            "custom_unknown",
+            &json!({})
+        ));
+    }
+
+    #[test]
+    fn confirmation_arguments_hide_content_and_secrets() {
+        let workspace = tool_confirmation_arguments(
+            "workspace_write_file",
+            &json!({ "path": "notes.txt", "content": "private text" }),
+        );
+        assert_eq!(workspace["path"], "notes.txt");
+        assert_eq!(workspace["content_length"], 12);
+        assert!(workspace.get("content").is_none());
+
+        let mcp = tool_confirmation_arguments(
+            "custom_tool",
+            &json!({ "api_key": "secret-value", "query": "visible" }),
+        );
+        assert_eq!(mcp["api_key"], "[12 characters hidden]");
+        assert_eq!(mcp["query"], "visible");
     }
 
     #[test]

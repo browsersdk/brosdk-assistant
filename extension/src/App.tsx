@@ -19,6 +19,7 @@ import {
   Search,
   Send,
   Settings,
+  ShieldAlert,
   Square,
   X,
 } from 'lucide-react'
@@ -32,6 +33,7 @@ import {
 } from './settings'
 import type {
   AgentEventPayload,
+  AgentConfirmationRequest,
   AgentStartResult,
   BackgroundRequest,
   ChatMessage,
@@ -148,6 +150,9 @@ export function App() {
   const [prompt, setPrompt] = useState('')
   const [busy, setBusy] = useState(false)
   const [activeRunId, setActiveRunId] = useState<string | null>(null)
+  const [pendingConfirmation, setPendingConfirmation] =
+    useState<AgentConfirmationRequest | null>(null)
+  const [confirmationBusy, setConfirmationBusy] = useState(false)
   const messagesRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const pickerLayerRef = useRef<HTMLDivElement>(null)
@@ -212,6 +217,27 @@ export function App() {
       if (event.event === 'agent.status') {
         const text = payload.state === 'model' ? 'Waiting for model...' : 'Agent is working...'
         setHealth({ kind: 'checking', text })
+        return
+      }
+      if (
+        event.event === 'agent.confirmation.request' &&
+        payload.confirmation_id &&
+        payload.tool_call_id &&
+        payload.tool_name &&
+        payload.summary
+      ) {
+        setPendingConfirmation(payload as AgentConfirmationRequest)
+        setConfirmationBusy(false)
+        setHealth({ kind: 'checking', text: `Approval required for ${payload.tool_name}` })
+        return
+      }
+      if (event.event === 'agent.confirmation.resolved') {
+        setPendingConfirmation(null)
+        setConfirmationBusy(false)
+        setHealth({
+          kind: 'checking',
+          text: payload.decision === 'approved' ? 'Action approved' : 'Action denied',
+        })
         return
       }
       if (event.event === 'agent.delta' && payload.delta) {
@@ -319,6 +345,8 @@ export function App() {
     activeRunIdRef.current = null
     startingRunRef.current = false
     setActiveRunId(null)
+    setPendingConfirmation(null)
+    setConfirmationBusy(false)
     setBusy(false)
   }
 
@@ -611,6 +639,31 @@ export function App() {
     }
   }
 
+  async function resolvePendingConfirmation(approved: boolean) {
+    const confirmation = pendingConfirmation
+    if (!confirmation || confirmationBusy) return
+    setConfirmationBusy(true)
+    try {
+      await callNative('agent.confirm', {
+        confirmation_id: confirmation.confirmation_id,
+        run_id: confirmation.run_id,
+        client_id: clientIdRef.current,
+        approved,
+      })
+      setPendingConfirmation(null)
+      setHealth({
+        kind: 'checking',
+        text: approved ? 'Action approved; continuing...' : 'Action denied; continuing...',
+      })
+    } catch (error) {
+      const text = error instanceof Error ? error.message : String(error)
+      setPendingConfirmation(null)
+      setHealth({ kind: 'error', text: `Could not submit decision: ${text}` })
+    } finally {
+      setConfirmationBusy(false)
+    }
+  }
+
   function openOptionsPage() {
     const url = chrome.runtime.getURL('settings.html')
     void chrome.tabs.create({ active: true, url }).catch(() => chrome.runtime.openOptionsPage())
@@ -783,7 +836,66 @@ export function App() {
           </button>
         </form>
       </footer>
+      {pendingConfirmation && (
+        <ConfirmationDialog
+          confirmation={pendingConfirmation}
+          busy={confirmationBusy}
+          onDecision={(approved) => void resolvePendingConfirmation(approved)}
+        />
+      )}
     </main>
+  )
+}
+
+function ConfirmationDialog({
+  confirmation,
+  busy,
+  onDecision,
+}: {
+  confirmation: AgentConfirmationRequest
+  busy: boolean
+  onDecision: (approved: boolean) => void
+}) {
+  const argumentsText = confirmation.arguments
+    ? JSON.stringify(confirmation.arguments, null, 2)
+    : ''
+  return (
+    <div className="confirmation-backdrop" role="presentation">
+      <section
+        className="confirmation-dialog"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirmation-title"
+        aria-describedby="confirmation-summary"
+      >
+        <div className="confirmation-heading">
+          <span className="confirmation-icon">
+            <ShieldAlert size={18} />
+          </span>
+          <div>
+            <h2 id="confirmation-title">Approve action</h2>
+            <p id="confirmation-summary">{confirmation.summary}</p>
+          </div>
+        </div>
+        <div className="confirmation-tool-name">{confirmation.tool_name}</div>
+        {argumentsText && <pre className="confirmation-arguments">{argumentsText}</pre>}
+        <div className="confirmation-actions">
+          <button autoFocus type="button" disabled={busy} onClick={() => onDecision(false)}>
+            <X size={15} />
+            Deny
+          </button>
+          <button
+            className="primary"
+            type="button"
+            disabled={busy}
+            onClick={() => onDecision(true)}
+          >
+            {busy ? <LoaderCircle className="working-spinner" size={15} /> : <Check size={15} />}
+            Approve
+          </button>
+        </div>
+      </section>
+    </div>
   )
 }
 
@@ -1126,7 +1238,7 @@ function ConfigureNotice({ onConfigure }: { onConfigure: () => void }) {
     <section className="configure-notice">
       <div>
         <h2>请前往配置</h2>
-        <p>插件需要先配置 MCP、模型和工作目录后才能开始会话。</p>
+        <p>请先配置模型 API。MCP 和工作空间均为可选能力。</p>
       </div>
       <button className="configure-button" type="button" onClick={onConfigure}>
         <Settings size={15} />

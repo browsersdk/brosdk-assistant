@@ -331,6 +331,11 @@ Current progress:
 - generic MCP discovery preserves tool annotations. Chat Mode defaults unknown
   tools to denied unless annotations explicitly mark them read-only and
   non-destructive; Agent Mode continues to expose the discovered tool set.
+- sensitive tool execution is gated in the native host by a one-time,
+  run-bound, client-bound confirmation. Browser mutations, workspace writes,
+  and MCP tools without trustworthy read-only metadata cannot run until the
+  side panel approves them; visible arguments redact entered text, file content,
+  and common secret fields.
 
 Continue the split in small verified steps, preserving protocol behavior after
 each extracted module. The target tree is directional, not a checklist: do not

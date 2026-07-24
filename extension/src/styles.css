@@ -139,6 +139,120 @@ button {
   background: var(--muted);
 }
 
+.confirmation-backdrop {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgb(24 24 27 / 42%);
+  padding: 16px;
+}
+
+.confirmation-dialog {
+  width: min(100%, 380px);
+  max-height: min(620px, calc(100vh - 32px));
+  overflow: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 24px 64px rgb(24 24 27 / 24%);
+  padding: 16px;
+}
+
+.confirmation-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.confirmation-heading h2,
+.confirmation-heading p {
+  margin: 0;
+}
+
+.confirmation-heading h2 {
+  font-size: 15px;
+  line-height: 1.3;
+}
+
+.confirmation-heading p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.confirmation-icon {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  place-items: center;
+  border-radius: 8px;
+  background: #fff7ed;
+  color: var(--accent-strong);
+}
+
+.confirmation-tool-name {
+  margin-top: 14px;
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.confirmation-arguments {
+  max-height: 220px;
+  overflow: auto;
+  margin: 8px 0 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-soft);
+  color: var(--text);
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.confirmation-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.confirmation-actions button {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.confirmation-actions button.primary {
+  border-color: var(--accent-strong);
+  background: var(--accent-strong);
+  color: #fff;
+}
+
+.confirmation-actions button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 .mode-status-chip.source-extension .mode-status-dot {
   background: var(--green);
 }

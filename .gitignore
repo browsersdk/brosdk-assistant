@@ -4,6 +4,8 @@ dist/
 .wxt/
 .output/
 *.log
+__pycache__/
+*.py[cod]
 .env
 .env.*
 native-host/native-host-manifest.json

@@ -6,7 +6,7 @@ export default defineConfig({
   manifest: {
     name: 'Brosdk Assistant',
     description: 'Chrome side panel assistant backed by a Rust native host.',
-    version: '0.1.0',
+    version: '0.2.0',
     permissions: ['nativeMessaging', 'sidePanel', 'storage', 'tabs', 'scripting'],
     host_permissions: ['<all_urls>'],
     side_panel: {

@@ -78,8 +78,8 @@ Known gaps:
 - host-owned conversation state is memory-only and not searchable or persisted,
 - Anthropic is not implemented,
 - frames and shadow roots are not fully represented by extension snapshots,
-- destructive actions have no confirmation layer,
-- installation is still a developer-oriented workflow.
+- installation still uses an unpacked extension and browser Developer mode,
+- API keys are stored in the native settings file instead of a credential vault.
 
 ## Milestones
 
@@ -153,6 +153,9 @@ successes. Text entry now uses native value setters with controlled-input event
 dispatch, and navigation reports bounded completion or timeout diagnostics.
 Unknown MCP tools are denied in Chat Mode unless standard annotations explicitly
 mark them read-only and non-destructive; Agent Mode remains capability-complete.
+Browser mutations, workspace writes, and MCP tools that are not explicitly
+read-only now pause for a run-bound, client-bound user confirmation. Denials and
+decisions are recorded with tool results.
 
 - Bind snapshot refs to a tab, document, and revision.
 - Improve controlled-input typing and event dispatch.
@@ -217,12 +220,11 @@ The roadmap should be judged by behavior, not feature count:
 
 ## Immediate Implementation Order
 
-1. Add confirmation decisions for sensitive browser and workspace mutations.
-2. Move full run details behind an explicit `run_id` lookup.
-3. Split extension browser execution into focused tool, snapshot, navigation,
+1. Move full run details behind an explicit `run_id` lookup.
+2. Split extension browser execution into focused tool, snapshot, navigation,
    and DOM modules.
-4. Add wait, scroll, and screenshot, then add select, keyboard, and tab lifecycle
+3. Add wait, scroll, and screenshot, then add select, keyboard, and tab lifecycle
    operations under the confirmation policy.
-5. Expand the controlled browser suite to summaries, forms, navigation, and
+4. Expand the controlled browser suite to summaries, forms, navigation, and
    cancellation.
-6. Harden packaging, security, and cross-platform installation.
+5. Harden packaging, security, and cross-platform installation.

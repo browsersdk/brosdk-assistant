@@ -101,18 +101,31 @@ Files:
 - extension/chrome-mv3: unpacked Chrome/Edge extension directory
 - native-host/target/release/brosdk-assistant-native.exe: Windows native messaging host
 - native-host/scripts/install-windows.ps1: native host registry installer
+- native-host/scripts/uninstall-windows.ps1: installed-files and registry uninstaller
 
 Install:
-1. Open chrome://extensions or edge://extensions.
-2. Enable Developer mode.
-3. Click Load unpacked and choose extension/chrome-mv3.
-4. Copy the loaded extension ID.
-5. From this package root, run:
-   powershell -ExecutionPolicy Bypass -File .\\native-host\\scripts\\install-windows.ps1 -ExtensionId <extension-id>
-6. Open the extension options page and configure API type, base URL, API key, model name, and MCP settings.
+1. Close Chrome or Edge before upgrading an existing installation.
+2. From this package root, run:
+   powershell -ExecutionPolicy Bypass -File .\\native-host\\scripts\\install-windows.ps1
+3. On first install, the script copies the extension to a stable directory and
+   asks for its extension ID. Follow the displayed chrome://extensions steps.
+4. Reload the extension and open its options page.
+5. Configure API type, base URL, API key, model name, and browser tools source.
+
+Installed files are stored under:
+%LOCALAPPDATA%\\BrosdkAssistant
 
 The native settings file is stored at:
 %APPDATA%\\BrosdkAssistant\\settings.json
+
+Upgrade:
+- Extract the new Windows package and run install-windows.ps1 again.
+- The saved extension ID and browser registrations are reused.
+
+Uninstall:
+  powershell -ExecutionPolicy Bypass -File $env:LOCALAPPDATA\\BrosdkAssistant\\uninstall-windows.ps1
+
+Add -RemoveSettings to also delete settings and the default workspace.
 
 For Chrome Web Store or packed-extension distribution, use the separate asset:
 brosdk-assistant-extension-v{version}-chrome.zip
@@ -206,8 +219,12 @@ def package_release(version: str, output_dir: Path, skip_build: bool, skip_tests
         staging_dir / "native-host" / "target" / "release" / "brosdk-assistant-native.exe",
     )
     copy_file(NATIVE_DIR / "scripts" / "install-windows.ps1", staging_dir / "native-host" / "scripts" / "install-windows.ps1")
-    copy_file(NATIVE_DIR / "native-host-manifest.example.json", staging_dir / "native-host" / "native-host-manifest.example.json")
+    copy_file(NATIVE_DIR / "scripts" / "uninstall-windows.ps1", staging_dir / "native-host" / "scripts" / "uninstall-windows.ps1")
     copy_file(ROOT / "README.md", staging_dir / "README.md")
+    for release_document in ["CHANGELOG.md", "LICENSE", "PRIVACY.md", "SECURITY.md"]:
+        source = ROOT / release_document
+        if source.exists():
+            copy_file(source, staging_dir / release_document)
     if (ROOT / "docs").exists():
         copy_tree(ROOT / "docs", staging_dir / "docs")
     write_install_notes(staging_dir / "INSTALL-WINDOWS.txt", version)
@@ -223,9 +240,9 @@ def package_release(version: str, output_dir: Path, skip_build: bool, skip_tests
 
     manifest = {
         "version": version,
-        "windows_package": str(package_zip),
+        "windows_package": package_zip.name,
         "windows_package_sha256": sha256(package_zip),
-        "extension_zip": str(extension_asset),
+        "extension_zip": extension_asset.name,
         "extension_zip_sha256": sha256(extension_asset),
     }
     (output_dir / f"{package_name}.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -267,9 +284,10 @@ def main() -> int:
         return 1
 
     print("\nRelease artifacts:")
-    print(f"  Windows package: {manifest['windows_package']}")
+    output_dir = args.output_dir.resolve()
+    print(f"  Windows package: {output_dir / manifest['windows_package']}")
     print(f"  SHA256: {manifest['windows_package_sha256']}")
-    print(f"  Extension zip: {manifest['extension_zip']}")
+    print(f"  Extension zip: {output_dir / manifest['extension_zip']}")
     print(f"  SHA256: {manifest['extension_zip_sha256']}")
     return 0
 
